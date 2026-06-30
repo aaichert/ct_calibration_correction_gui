@@ -5,6 +5,12 @@ Based on [xray-epipolar-consistency](https://github.com/aaichert/xray-epipolar-c
 
 The tool helps you set up, run, and inspect multi-stage geometry optimization for cone-beam CT scans using Epipolar Consistency Conditions (ECC), and to hand off the corrected trajectory directly to the reconstruction GUI.
 
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=fl2Iy_WEyJA">
+    <img src="https://img.youtube.com/vi/fl2Iy_WEyJA/hqdefault.jpg" style="width: 600px; height: auto;" alt="Watch the video" />
+  </a>
+</p>
+
 ### Real Walnut Reconstruction (Misaligned vs. Corrected)
 <p align="center">
   <img src="screenshots/misaligned_slice_x.png" alt="Misaligned" style="width: 300px; height: auto;">
