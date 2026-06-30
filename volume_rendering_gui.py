@@ -39,7 +39,10 @@ import ProjectiveGeometry23.utils as pgu
 from ProjectiveGeometry23.central_projection import ProjectionMatrix
 from ProjectiveGeometry23.source_detector_geometry import SourceDetectorGeometry
 from ProjectiveGeometry23.homography import rotation_x, rotation_z, scale
-from fileformats.ompl import load_ompl
+try:
+    from ct_recon_fdk_astra.fileformats.ompl import load_ompl
+except ImportError:
+    from fileformats.ompl import load_ompl
 from xray_epipolar_consistency import VolumeRenderer
 
 # -----------------------------------------------------------------------------
@@ -775,12 +778,7 @@ class VolumeRenderingGUIApp(QMainWindow):
         self.chk_svg_overlay.setChecked(True)
         self.chk_svg_overlay.toggled.connect(self.render_viewport)
         chk_layout.addWidget(self.chk_svg_overlay)
-        
-        self.chk_binning = QCheckBox("2x2")
-        self.chk_binning.setToolTip("Render at half resolution for more responsive GUI")
-        self.chk_binning.setChecked(False)
-        self.chk_binning.toggled.connect(self.render_viewport)
-        chk_layout.addWidget(self.chk_binning)
+
         
         active_layout.addLayout(chk_layout)
         
@@ -1962,18 +1960,7 @@ class VolumeRenderingGUIApp(QMainWindow):
                     [0, 0, 1]
                 ], dtype=float)
                 
-                P_view = H_shift @ H_scale @ P_active_P_T
-                if self.chk_binning.isChecked():
-                    render_w = max(int(target_w) // 2, 1)
-                    render_h = max(int(target_h) // 2, 1)
-                    H_bin = np.array([
-                        [0.5, 0, 0],
-                        [0, 0.5, 0],
-                        [0, 0, 1]
-                    ], dtype=float)
-                    P_proj = ProjectionMatrix(H_bin @ H_scale @ P_active_P_T, image_size=(render_w, render_h), pixel_spacing=2.0 * P_active.pixel_spacing / scale_factor)
-                else:
-                    P_proj = ProjectionMatrix(H_scale @ P_active_P_T, image_size=(target_w, target_h), pixel_spacing=P_active.pixel_spacing / scale_factor)
+                P_proj = ProjectionMatrix(H_scale @ P_active_P_T, image_size=(target_w, target_h), pixel_spacing=P_active.pixel_spacing / scale_factor)
                 self.curr_pad = (pad_x, pad_y, target_w, target_h)
             else:
                 self.viewport_container.layout().setAlignment(Qt.AlignmentFlag(0))
@@ -2001,17 +1988,7 @@ class VolumeRenderingGUIApp(QMainWindow):
                     T_display[:3, 3] = -s_scale * (R_align @ self.isocenter)
                     
                 P_view = self.viewport.P_display.P @ T_view @ T_display @ self.T
-                if self.chk_binning.isChecked():
-                    render_w = max(int(w_w) // 2, 1)
-                    render_h = max(int(w_h) // 2, 1)
-                    H_bin = np.array([
-                        [0.5, 0, 0],
-                        [0, 0.5, 0],
-                        [0, 0, 1]
-                    ], dtype=float)
-                    P_proj = ProjectionMatrix(H_bin @ P_view, image_size=(render_w, render_h), pixel_spacing=2.0)
-                else:
-                    P_proj = ProjectionMatrix(P_view, image_size=(w_w, w_h), pixel_spacing=1.0)
+                P_proj = ProjectionMatrix(P_view, image_size=(w_w, w_h), pixel_spacing=1.0)
                 self.curr_pad = (0, 0, w_w, w_h)
             
             # 2. Render CUDA Volume Projection

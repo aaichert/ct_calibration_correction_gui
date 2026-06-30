@@ -35,7 +35,10 @@ from ProjectiveGeometry23.utils import hessianNormalForm
 from ProjectiveGeometry23 import pluecker
 import svg_snip.Elements3D as e3d
 from svg_snip.Composer import Composer
-from fileformats.ompl import load_ompl, save_ompl
+try:
+    from ct_recon_fdk_astra.fileformats.ompl import load_ompl, save_ompl
+except ImportError:
+    from fileformats.ompl import load_ompl, save_ompl
 
 # Import Epipolar Consistency components
 from xray_epipolar_consistency.scan import Scan
@@ -138,7 +141,13 @@ class QtProgressBarContext:
 # Thread & Buffer helper classes removed. ProcessConsoleWindow is used instead.
 
 
-from gui.reconstruction_gui import ReconstructionGUIApp
+try:
+    from ct_recon_fdk_astra.gui.reconstruction_gui import ReconstructionGUIApp
+except ImportError:
+    try:
+        from gui.reconstruction_gui import ReconstructionGUIApp
+    except ImportError:
+        from reconstruct.gui.reconstruction_gui import ReconstructionGUIApp
 
 class InteractiveReconstructionGUI(ReconstructionGUIApp):
     def __init__(self, config_path, parent_window, edit_config_only=False):
@@ -4496,9 +4505,12 @@ class GeometryCorrectionGUI(QMainWindow):
             
         # Spawn process console window
         try:
-            from gui.process_console import ProcessConsoleWindow
+            from ct_recon_fdk_astra.gui.process_console import ProcessConsoleWindow
         except ImportError:
-            from reconstruct.gui.process_console import ProcessConsoleWindow
+            try:
+                from gui.process_console import ProcessConsoleWindow
+            except ImportError:
+                from reconstruct.gui.process_console import ProcessConsoleWindow
             
         cmd = f'"{sys.executable}" -u -m xray_epipolar_consistency.tools.geometry_correction "{config_path}"'
         self.console_win = ProcessConsoleWindow(
@@ -4800,9 +4812,12 @@ class GeometryCorrectionGUI(QMainWindow):
                 reconstruct_file = reconstruct_file[:-1]
                 
             try:
-                from gui.process_console import ProcessConsoleWindow
+                from ct_recon_fdk_astra.gui.process_console import ProcessConsoleWindow
             except ImportError:
-                from reconstruct.gui.process_console import ProcessConsoleWindow
+                try:
+                    from gui.process_console import ProcessConsoleWindow
+                except ImportError:
+                    from reconstruct.gui.process_console import ProcessConsoleWindow
                 
             cmd = f'"{sys.executable}" -u "{reconstruct_file}" "{new_recon_json_path}"'
             self.recon_console_win = ProcessConsoleWindow(
@@ -4845,8 +4860,18 @@ class GeometryCorrectionGUI(QMainWindow):
 
     def resolve_nrrd_view_3d_file(self):
         try:
-            import gui.nrrd_view_3d
-            return os.path.abspath(gui.nrrd_view_3d.__file__)
+            import ct_recon_fdk_astra.gui.nrrd_view_3d as nrrd_view_3d
+            return os.path.abspath(nrrd_view_3d.__file__)
+        except Exception:
+            pass
+        try:
+            import gui.nrrd_view_3d as nrrd_view_3d
+            return os.path.abspath(nrrd_view_3d.__file__)
+        except Exception:
+            pass
+        try:
+            import reconstruct.gui.nrrd_view_3d as nrrd_view_3d
+            return os.path.abspath(nrrd_view_3d.__file__)
         except Exception:
             pass
         cur_dir = os.path.dirname(os.path.abspath(__file__))
@@ -4910,7 +4935,13 @@ class GeometryCorrectionGUI(QMainWindow):
                     output_file = os.path.join(os.path.dirname(config_path), output_file)
                 output_file = os.path.normpath(output_file)
                 if os.path.exists(output_file):
-                    from gui.nrrd_view_3d import NrrdView3DWindow
+                    try:
+                        from ct_recon_fdk_astra.gui.nrrd_view_3d import NrrdView3DWindow
+                    except ImportError:
+                        try:
+                            from gui.nrrd_view_3d import NrrdView3DWindow
+                        except ImportError:
+                            from reconstruct.gui.nrrd_view_3d import NrrdView3DWindow
                     self.nrrd_win = NrrdView3DWindow()
                     self.nrrd_win.show()
                     self.nrrd_win.open_file(output_file)
@@ -4969,7 +5000,13 @@ class GeometryCorrectionGUI(QMainWindow):
                         print(f"Error resolving reconstructed paths in GUI: {e}")
                 
                 if os.path.exists(recon_misaligned) and os.path.exists(recon_optimized):
-                    from gui.nrrd_view_3d import NrrdView3DWindow
+                    try:
+                        from ct_recon_fdk_astra.gui.nrrd_view_3d import NrrdView3DWindow
+                    except ImportError:
+                        try:
+                            from gui.nrrd_view_3d import NrrdView3DWindow
+                        except ImportError:
+                            from reconstruct.gui.nrrd_view_3d import NrrdView3DWindow
                     class InteractiveNrrdView3DWindow(NrrdView3DWindow):
                         def __init__(self, parent_window):
                             self.parent_window = parent_window
