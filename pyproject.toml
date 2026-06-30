@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ct-calibration-correction-gui"
+version = "0.1.0"
+description = "GUI for X-Ray Geometry Calibration and Motion Correction based on Epipolar Consistency Conditions"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Andre Aichert", email = "aaichert@gmail.com"}
+]
+
+# PyPI-resolvable runtime dependencies.
+# NOTE: xray-epipolar-consistency and ct-recon-fdk-astra require a C++/CUDA build
+# and will never be on PyPI. Install them first via:
+#   pip install -r requirements-git.txt
+dependencies = [
+    "numpy>=1.20",
+    "pillow>=9.0.0",
+    "matplotlib>=3.5.0",
+    "PyQt6>=6.0.0",
+    "PyQt6-Qt6>=6.0.0",
+    "PyQt6-sip>=13.0.0",
+    "pynrrd>=1.1.0",
+    "tifffile>=2022.0.0",
+    "scipy>=1.7.0",
+    "ProjectiveGeometry23>=1.1.0",
+    "svg_snip>=1.1.0",
+]
+
+[project.scripts]
+GeometryCorrectionGUI = "geometry_correction_gui:main"
+VolumeRenderingGUIPy = "volume_rendering_gui:main"
+
+[tool.setuptools]
+# Single-module package – the script lives at the repo root
+py-modules = ["geometry_correction_gui", "volume_rendering_gui"]
+
+[tool.setuptools.package-data]
+"*" = ["transfer_functions/*.json"]

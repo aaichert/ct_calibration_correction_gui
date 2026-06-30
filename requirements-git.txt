@@ -1,0 +1,11 @@
+# Git-sourced dependencies that are not (and likely never will be) on PyPI,
+# because they require a C++/CUDA build step at install time.
+#
+# Install these BEFORE installing this package:
+#   pip install -r requirements-git.txt
+
+# Epipolar Consistency Conditions — CUDA C++ extension + Python tools + GUI helpers
+git+https://github.com/aaichert/xray-epipolar-consistency.git[gui]
+
+# FDK cone-beam CT reconstruction with ASTRA + Qt GUI
+git+https://github.com/aaichert/ct_recon_fdk_astra.git[gui]
