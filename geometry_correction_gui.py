@@ -1042,6 +1042,7 @@ class GeometryCorrectionGUI(QMainWindow):
         self.model_matrix = np.eye(4)
         
         self.current_recon_json = None
+        self.original_recon_config_path = None
         self.current_config_path = None
         self._gaussian_sigma = None
         self.dirty = False
@@ -3007,17 +3008,60 @@ class GeometryCorrectionGUI(QMainWindow):
             with open(file_path, 'r') as f:
                 config = json.load(f)
 
-            # ---- quick metadata peek (no pixel data) ----
-            # Resolve the reconstruction config the same way the rest of the
-            # method does so we can count images and peek at dimensions.
-            recon_config_for_peek = config
+            # Resolve the reconstruction config path (original dataset config)
+            recon_json_path = None
+            recon_config = config
             if "input_data" in config:
-                config_dir_peek = os.path.dirname(os.path.abspath(file_path))
-                rpath = config.get("input_data", "")
-                rabs = os.path.normpath(os.path.join(config_dir_peek, rpath))
-                if os.path.exists(rabs):
-                    with open(rabs, 'r') as rf:
-                        recon_config_for_peek = json.load(rf)
+                # Check for reconstruction_config or source_reconstruction_config key in geometry_correction.json
+                recon_config_rel = config.get("reconstruction_config") or config.get("source_reconstruction_config")
+                if recon_config_rel:
+                    test_path = os.path.normpath(os.path.join(config_dir, recon_config_rel))
+                    # Only accept if it is not in the same output directory
+                    if os.path.exists(test_path) and os.path.dirname(os.path.abspath(test_path)) != config_dir:
+                        recon_json_path = test_path
+                
+                # If not found or was in the same output directory, try to use ../reconstruction.json
+                if not recon_json_path:
+                    parent_recon_path = os.path.normpath(os.path.join(config_dir, "..", "reconstruction.json"))
+                    if os.path.exists(parent_recon_path):
+                        recon_json_path = parent_recon_path
+                
+                # If neither exists, prompt the user to select the complete reconstruction JSON file containing all images
+                if not recon_json_path:
+                    msg_box = QMessageBox(self)
+                    msg_box.setWindowTitle("Select Reconstruction JSON")
+                    msg_box.setIcon(QMessageBox.Icon.Question)
+                    msg_box.setText("Could not locate the original reconstruction config automatically.\n\nWould you like to manually select the complete reconstruction JSON config containing all images?")
+                    msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+                    msg_box.setDefaultButton(QMessageBox.StandardButton.Yes)
+                    if msg_box.exec() == QMessageBox.StandardButton.Yes:
+                        chosen_path, _ = QFileDialog.getOpenFileName(
+                            self, "Select Reconstruction Config JSON", "", "JSON Files (*.json)"
+                        )
+                        if chosen_path and os.path.exists(chosen_path):
+                            recon_json_path = chosen_path
+                
+                # Set original_recon_config_path to the found full config path (only if outside output directory)
+                if recon_json_path and os.path.dirname(os.path.abspath(recon_json_path)) != config_dir:
+                    self.original_recon_config_path = recon_json_path
+                else:
+                    self.original_recon_config_path = None
+                
+                # Fallback to input_data if neither exists (and user did not select one)
+                if not recon_json_path:
+                    input_data_rel = config.get("input_data")
+                    if input_data_rel:
+                        recon_json_path = os.path.normpath(os.path.join(config_dir, input_data_rel))
+                        if not os.path.exists(recon_json_path):
+                            recon_json_path = file_path
+                    else:
+                        recon_json_path = file_path
+
+                if os.path.exists(recon_json_path) and recon_json_path != file_path:
+                    with open(recon_json_path, 'r') as rf:
+                        recon_config = json.load(rf)
+            
+            recon_config_for_peek = recon_config
 
             # Skip the dataset dialog if the caller set this flag
             # (e.g. returning from the Reconstruction GUI — settings are unchanged)
@@ -3029,7 +3073,7 @@ class GeometryCorrectionGUI(QMainWindow):
                 dlg = ConfigLoadDialog(
                     self,
                     recon_config=recon_config_for_peek,
-                    recon_config_path=file_path,
+                    recon_config_path=recon_json_path or file_path,
                     current_undersample=self.spin_undersample.value(),
                     current_dtr_factor=init_dtr_factor,
                     current_gaussian_sigma=init_gaussian_sigma,
@@ -3092,34 +3136,29 @@ class GeometryCorrectionGUI(QMainWindow):
             # Check if this is a geometry optimization config (has input_data, and optionally geometry_optimization)
             if "input_data" in config:
                 config_dir = os.path.dirname(os.path.abspath(file_path))
-                input_data_rel = config.get("input_data")
-                if input_data_rel:
-                    recon_json_path = os.path.normpath(os.path.join(config_dir, input_data_rel))
-                    if os.path.exists(recon_json_path):
-                        # Load reconstruction JSON
-                        with open(recon_json_path, 'r') as rf:
-                            recon_config = json.load(rf)
-                    else:
-                        recon_config = config
-                else:
-                    recon_config = config
                 
                 # Check for stages to select
                 geom_opt = config.get("geometry_optimization", {})
                 stages_to_check = geom_opt.get("stages", [])
                 self.initial_stages_to_check = stages_to_check
                 
-                # Use reconstruction config as our base
+                # Use reconstruction config as our base (resolved in the peek section above)
                 self.current_recon_json = recon_config
+                
+                # Show the original reconstruction config path if available, else recon_json_path
+                display_recon_path = self.original_recon_config_path or recon_json_path
                 self.txt_recon_path.blockSignals(True)
-                self.txt_recon_path.setText(recon_json_path if input_data_rel and os.path.exists(recon_json_path) else file_path)
+                self.txt_recon_path.setText(display_recon_path if display_recon_path and os.path.exists(display_recon_path) else file_path)
                 self.txt_recon_path.blockSignals(False)
                 
                 self.current_config_path = file_path
                 
-                # Restore reconstruction checkbox state
+                # Restore reconstruction checkbox state based on run_reconstruction key (or fallback to reconstruction_config existence)
+                run_recon = config.get("run_reconstruction")
+                if run_recon is None:
+                    run_recon = "reconstruction_config" in config
                 self.chk_run_recon.blockSignals(True)
-                self.chk_run_recon.setChecked("reconstruction_config" in config)
+                self.chk_run_recon.setChecked(bool(run_recon))
                 self.chk_run_recon.blockSignals(False)
 
                 self.chk_create_report.blockSignals(True)
@@ -3134,13 +3173,14 @@ class GeometryCorrectionGUI(QMainWindow):
                     self.txt_out_dir.setText(out_dir_abs)
                     self.txt_out_dir.blockSignals(False)
                 else:
-                    default_out = self.compute_default_output_dir(recon_json_path if (input_data_rel and os.path.exists(recon_json_path)) else file_path)
+                    default_out = self.compute_default_output_dir(recon_json_path if (recon_json_path and os.path.exists(recon_json_path)) else file_path)
                     self.txt_out_dir.blockSignals(True)
                     self.txt_out_dir.setText(default_out)
                     self.txt_out_dir.blockSignals(False)
             else:
                 # 2. Reconstruction Config (original workflow)
                 self.current_recon_json = config
+                self.original_recon_config_path = file_path
                 self.txt_recon_path.blockSignals(True)
                 self.txt_recon_path.setText(file_path)
                 self.txt_recon_path.blockSignals(False)
@@ -3205,15 +3245,30 @@ class GeometryCorrectionGUI(QMainWindow):
             
             # Load OMPL trajectory (cached)
             if not hasattr(self, 'P_list') or not self.P_list:
-                ompl_file = config.get("ompl_file")
-                if not ompl_file:
-                    raise KeyError("Reconstruction config lacks 'ompl_file'.")
-                    
-                if os.path.isabs(ompl_file):
-                    ompl_path = ompl_file
+                # Check for existing OMPL files in the output directory in priority order
+                opt_ompl_path = None
+                out_dir = self.txt_out_dir.text().strip()
+                if out_dir and os.path.isdir(out_dir):
+                    for opt_name in ["trajectory_optimized.ompl", "trajectory.ompl", "reconstructed_trajectory.ompl"]:
+                        test_path = os.path.normpath(os.path.join(out_dir, opt_name))
+                        if os.path.exists(test_path):
+                            opt_ompl_path = test_path
+                            break
+                
+                if opt_ompl_path:
+                    print(f"Restoring complete trajectory from: {opt_ompl_path}")
+                    self.P_list = load_ompl(opt_ompl_path)
                 else:
-                    ompl_path = os.path.normpath(os.path.join(recon_dir, ompl_file))
-                self.P_list = load_ompl(ompl_path)
+                    ompl_file = config.get("ompl_file")
+                    if not ompl_file:
+                        raise KeyError("Reconstruction config lacks 'ompl_file'.")
+                        
+                    if os.path.isabs(ompl_file):
+                        ompl_path = ompl_file
+                    else:
+                        ompl_path = os.path.normpath(os.path.join(recon_dir, ompl_file))
+                    print(f"Loading complete trajectory from: {ompl_path}")
+                    self.P_list = load_ompl(ompl_path)
                 self.P_list_original = list(self.P_list)
             
             # Set voxel geometry
@@ -4384,7 +4439,7 @@ class GeometryCorrectionGUI(QMainWindow):
             self.stages_cache = new_stages_cache
             
             # Create undersampled data JSON file
-            recon_config_abs = self.txt_recon_path.text()
+            recon_config_abs = self.original_recon_config_path or self.txt_recon_path.text()
             if recon_config_abs and recon_config_abs != "No file loaded" and os.path.exists(recon_config_abs):
                 orig_recon_rel = safe_relpath(recon_config_abs, config_dir)
             else:
@@ -4450,6 +4505,7 @@ class GeometryCorrectionGUI(QMainWindow):
                 "input_data": undersampled_recon_filename,
                 "output_dir": safe_relpath(self.txt_out_dir.text(), config_dir),
                 "create_report": self.chk_create_report.isChecked(),
+                "run_reconstruction": self.chk_run_recon.isChecked(),
                 "metric_config": {
                     "convert_to_line_integral": self.chk_line_integral.isChecked(),
                     "dtr_size_factor": dtr_factor,
@@ -4461,7 +4517,7 @@ class GeometryCorrectionGUI(QMainWindow):
                     "stages": checked_rel_paths
                 }
             }
-            if self.chk_run_recon.isChecked() and orig_recon_rel:
+            if orig_recon_rel:
                 config_json["reconstruction_config"] = orig_recon_rel
             
             with open(file_path, 'w') as mf:
