@@ -893,11 +893,12 @@ class Sweep2DWindow(QMainWindow):
 
 
 class Stage:
-    def __init__(self, name="Optimization Stage", optimizer="OptimizerPowell", maxiter=200, ftol=1e-6):
+    def __init__(self, name="Optimization Stage", optimizer="OptimizerPowell", maxiter=200, ftol=1e-6, eps=1e-3):
         self.name = name
         self.optimizer = optimizer
         self.maxiter = maxiter
         self.ftol = ftol
+        self.eps = eps
         self.parameterizations = [] # List of instantiated parameterization objects
 
 
@@ -1570,6 +1571,15 @@ class GeometryCorrectionGUI(QMainWindow):
         self.txt_ftol.valueChanged.connect(self.update_stage_ftol)
         opt_settings_lay.addWidget(self.txt_ftol)
         
+        opt_settings_lay.addWidget(QLabel("Step Size (eps):"))
+        self.txt_eps = QDoubleSpinBox()
+        self.txt_eps.setDecimals(6)
+        self.txt_eps.setRange(1e-9, 1.0)
+        self.txt_eps.setValue(1e-3)
+        self.txt_eps.setSingleStep(1e-4)
+        self.txt_eps.valueChanged.connect(self.update_stage_eps)
+        opt_settings_lay.addWidget(self.txt_eps)
+        
         self.stage_details_lay.addLayout(opt_settings_lay)
         
         # Parameterizations List
@@ -1971,6 +1981,10 @@ class GeometryCorrectionGUI(QMainWindow):
         self.txt_ftol.setValue(stage.ftol)
         self.txt_ftol.blockSignals(False)
         
+        self.txt_eps.blockSignals(True)
+        self.txt_eps.setValue(stage.eps)
+        self.txt_eps.blockSignals(False)
+        
         # Update Parameterizations List
         self.list_params.blockSignals(True)
         self.list_params.clear()
@@ -2005,6 +2019,12 @@ class GeometryCorrectionGUI(QMainWindow):
         stage, _ = self.get_active_stage()
         if stage:
             stage.ftol = val
+            self.update_json_preview()
+
+    def update_stage_eps(self, val):
+        stage, _ = self.get_active_stage()
+        if stage:
+            stage.eps = val
             self.update_json_preview()
 
     def select_parameterization(self, row):
@@ -2062,10 +2082,7 @@ class GeometryCorrectionGUI(QMainWindow):
             # Optimize (Checkbox)
             chk = QCheckBox()
             chk.setChecked(row_data["config"].get("opt", False))
-            if row_data["is_group"]:
-                chk.stateChanged.connect(lambda state, r_data=row_data, p=param_obj: self.on_group_opt_changed(r_data, p, state))
-            else:
-                chk.stateChanged.connect(lambda state, n=row_data["param_name"], p=param_obj: self.on_param_opt_changed(n, p, state))
+            chk.stateChanged.connect(lambda state, n=row_data["display_name"], p=param_obj: self.on_param_opt_changed(n, p, state))
             self.table_param_details.setCellWidget(idx, 1, chk)
             
             # Range Min
@@ -2074,10 +2091,7 @@ class GeometryCorrectionGUI(QMainWindow):
             range_min.setDecimals(4)
             range_min.setValue(row_data["config"].get("range", (-1.0, 1.0))[0])
             range_min.setSingleStep(0.5)
-            if row_data["is_group"]:
-                range_min.valueChanged.connect(lambda val, r_data=row_data, p=param_obj: self.on_group_range_changed(r_data, p, val, True))
-            else:
-                range_min.valueChanged.connect(lambda val, n=row_data["param_name"], p=param_obj: self.on_param_range_changed(n, p, val, True))
+            range_min.valueChanged.connect(lambda val, n=row_data["display_name"], p=param_obj: self.on_param_range_changed(n, p, val, True))
             self.table_param_details.setCellWidget(idx, 2, range_min)
             
             # Range Max
@@ -2086,10 +2100,7 @@ class GeometryCorrectionGUI(QMainWindow):
             range_max.setDecimals(4)
             range_max.setValue(row_data["config"].get("range", (-1.0, 1.0))[1])
             range_max.setSingleStep(0.5)
-            if row_data["is_group"]:
-                range_max.valueChanged.connect(lambda val, r_data=row_data, p=param_obj: self.on_group_range_changed(r_data, p, val, False))
-            else:
-                range_max.valueChanged.connect(lambda val, n=row_data["param_name"], p=param_obj: self.on_param_range_changed(n, p, val, False))
+            range_max.valueChanged.connect(lambda val, n=row_data["display_name"], p=param_obj: self.on_param_range_changed(n, p, val, False))
             self.table_param_details.setCellWidget(idx, 3, range_max)
             
             # Auto Range (ComboBox)
@@ -2186,39 +2197,33 @@ class GeometryCorrectionGUI(QMainWindow):
             QMessageBox.critical(self, "1D Search Error", f"Failed to perform 1D search:\n{e}")
 
     def on_param_opt_changed(self, name, param_obj, state):
-        param_obj.parameters[name]["opt"] = (state == Qt.CheckState.Checked.value)
-        self.render_viewports()
-        self.update_json_preview()
-
-    def on_group_opt_changed(self, row_data, param_obj, state):
         opt_val = (state == Qt.CheckState.Checked.value)
-        for name, _ in row_data["param_list"]:
-            param_obj.parameters[name]["opt"] = opt_val
+        prefix = name.split("[")[0] if "[" in name else name
+        for k in param_obj.parameters:
+            if k.startswith(prefix):
+                param_obj.parameters[k]["opt"] = opt_val
         self.render_viewports()
         self.update_json_preview()
 
     def on_param_val_changed(self, name, param_obj, val):
-        param_obj.parameters[name]["value"] = val
+        prefix = name.split("[")[0] if "[" in name else name
+        for k in param_obj.parameters:
+            if k.startswith(prefix):
+                param_obj.parameters[k]["value"] = val
+
         self.render_viewports()
         self.update_json_preview()
 
     def on_param_range_changed(self, name, param_obj, val, is_min):
-        r = list(param_obj.parameters[name].get("range", (-1.0, 1.0)))
-        if is_min:
-            r[0] = val
-        else:
-            r[1] = val
-        param_obj.parameters[name]["range"] = tuple(r)
-        self.update_json_preview()
-
-    def on_group_range_changed(self, row_data, param_obj, val, is_min):
-        for name, _ in row_data["param_list"]:
-            r = list(param_obj.parameters[name].get("range", (-1.0, 1.0)))
-            if is_min:
-                r[0] = val
-            else:
-                r[1] = val
-            param_obj.parameters[name]["range"] = tuple(r)
+        prefix = name.split("[")[0] if "[" in name else name
+        for k in param_obj.parameters:
+            if k.startswith(prefix):
+                r = list(param_obj.parameters[k].get("range", (-1.0, 1.0)))
+                if is_min:
+                    r[0] = val
+                else:
+                    r[1] = val
+                param_obj.parameters[k]["range"] = tuple(r)
         self.update_json_preview()
 
     def apply_auto_range(self, row_data, param_obj, option):
@@ -2254,15 +2259,13 @@ class GeometryCorrectionGUI(QMainWindow):
         elif option == "+/- 100":
             R = 100.0
             
-        # Update parameters
-        if row_data["is_group"]:
-            for name, _ in row_data["param_list"]:
-                val = param_obj.parameters[name].get("value", 0.0)
-                param_obj.parameters[name]["range"] = (val - R, val + R)
-        else:
-            name = row_data["param_name"]
-            val = param_obj.parameters[name].get("value", 0.0)
-            param_obj.parameters[name]["range"] = (val - R, val + R)
+        # Update parameters using prefix matching
+        display_name = row_data["display_name"]
+        prefix = display_name.split("[")[0] if "[" in display_name else display_name
+        for k in param_obj.parameters:
+            if k.startswith(prefix):
+                val = param_obj.parameters[k].get("value", 0.0)
+                param_obj.parameters[k]["range"] = (val - R, val + R)
             
         # Refresh the table display to reflect the new ranges
         current_row = self.list_params.currentRow()
