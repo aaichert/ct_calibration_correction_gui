@@ -4,23 +4,31 @@ import json
 import numpy as np
 import base64
 import io
+import re
+import traceback
+import webbrowser
+import shutil
+import datetime
+import subprocess
+from copy import deepcopy
 from PIL import Image
+from PIL import Image as PILImage
+import nrrd
+from tifffile import imread
+import reconstruct
 
-# Add project root to sys.path
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QTextEdit, QPushButton, QLabel, QCheckBox, QSlider,
     QSpinBox, QDoubleSpinBox, QStatusBar, QFileDialog, QGroupBox, QScrollArea, QFrame,
     QMessageBox, QListWidget, QComboBox, QTableWidget, QTableWidgetItem, QTabWidget,
-    QHeaderView, QListWidgetItem, QInputDialog, QLineEdit, QProgressDialog, QDialog
+    QHeaderView, QListWidgetItem, QInputDialog, QLineEdit, QProgressDialog, QDialog, QMenu
 )
 from PyQt6.QtSvgWidgets import QSvgWidget
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QProcess
-from PyQt6.QtGui import QFont, QAction
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QProcess, QUrl
+from PyQt6.QtGui import QFont, QAction, QDesktopServices
 
 # Matplotlib integration
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -35,14 +43,20 @@ from ProjectiveGeometry23.utils import hessianNormalForm
 from ProjectiveGeometry23 import pluecker
 import svg_snip.Elements3D as e3d
 from svg_snip.Composer import Composer
-try:
-    from ct_recon_fdk_astra.fileformats.ompl import load_ompl, save_ompl
-except ImportError:
-    from fileformats.ompl import load_ompl, save_ompl
+from svg_snip.Composer import image as svg_image
+from svg_snip.Elements import rect, polyline
+
+# Import ct_recon_fdk_astra components
+from ct_recon_fdk_astra.fileformats.ompl import load_ompl, save_ompl
+from ct_recon_fdk_astra.gui.reconstruction_gui import ReconstructionGUIApp
+from ct_recon_fdk_astra.gui.process_console import AnsiHtmlParser, ProcessConsoleWindow
+from ct_recon_fdk_astra.gui.nrrd_view_3d import NrrdView3DWindow
+import ct_recon_fdk_astra.gui.nrrd_view_3d as nrrd_view_3d
 
 # Import Epipolar Consistency components
 from xray_epipolar_consistency.scan import Scan
 import xray_epipolar_consistency as ecc
+from xray_epipolar_consistency import ProgressBar
 from xray_epipolar_consistency.parameterization import from_dict, ParameterizationChain
 from xray_epipolar_consistency.parameterization.detector_shift import DetectorShift
 from xray_epipolar_consistency.parameterization.detector_orientation import DetectorOrientation
@@ -108,12 +122,10 @@ class QtProgressBarContext:
         self.dialog = None
 
     def __enter__(self):
-        from xray_epipolar_consistency import ProgressBar
         ProgressBar.set_callback(self.on_progress)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        from xray_epipolar_consistency import ProgressBar
         ProgressBar.set_callback(None)
         if self.dialog is not None:
             self.dialog.close()
@@ -141,13 +153,7 @@ class QtProgressBarContext:
 # Thread & Buffer helper classes removed. ProcessConsoleWindow is used instead.
 
 
-try:
-    from ct_recon_fdk_astra.gui.reconstruction_gui import ReconstructionGUIApp
-except ImportError:
-    try:
-        from gui.reconstruction_gui import ReconstructionGUIApp
-    except ImportError:
-        from reconstruct.gui.reconstruction_gui import ReconstructionGUIApp
+from ct_recon_fdk_astra.gui.reconstruction_gui import ReconstructionGUIApp
 
 class InteractiveReconstructionGUI(ReconstructionGUIApp):
     def __init__(self, config_path, parent_window, edit_config_only=False):
@@ -283,13 +289,11 @@ class OptimizationThread(QThread):
         
     def run(self):
         # Redirect stdout to capture prints from CalibrationAndMotionCorrection
-        import sys
         old_stdout = sys.stdout
         sys.stdout = StdoutRedirector(self.log_signal)
         
         try:
             # We copy the scan's images and projection matrices to make sure we don't mess with them until confirmed
-            from xray_epipolar_consistency.scan import Scan
             # Let's clone the projection matrices
             Ps_copy = [ProjectionMatrix(P.P.copy(), P.image_size, P.pixel_spacing) for P in self.scan.Ps]
             # Images are read-only numpy arrays, so reference is fine
@@ -305,8 +309,39 @@ class OptimizationThread(QThread):
             result = calib.optimize()
             self.finished_signal.emit(result)
         except Exception as e:
-            import traceback
             traceback.print_exc()
+            # If the user cancelled, we can build the best results dictionary
+            if self.calib and hasattr(self.calib, "current_problem") and self.calib.current_problem:
+                prob = self.calib.current_problem
+                if prob.is_cancelled and prob.best_parameters is not None:
+                    # Construct a result dictionary with the best parameters found so far
+                    best_chain = deepcopy(prob.parameterization)
+                    best_chain.set_parameter_vector(prob.best_parameters)
+                    
+                    image_sizes = [P.image_size.copy() for P in Ps_copy]
+                    pixel_spacings = [P.pixel_spacing for P in Ps_copy]
+                    Ps_initial_pm = [
+                        ProjectionMatrix(P_arr.P.copy(), img_sz, px_sp)
+                        for P_arr, img_sz, px_sp in zip(Ps_copy, image_sizes, pixel_spacings)
+                    ]
+                    Ps_optimized = best_chain.apply_to_trajectory(Ps_initial_pm)
+                    
+                    result = {
+                        "is_cancelled": True,
+                        "optimized_parameterization": best_chain.to_dict(),
+                        "cost_history": prob.cost_function_values,
+                        "optimization_time_sec": 0.0,
+                        "Ps_optimized": [P.P.tolist() for P in Ps_optimized],
+                        "stages": [{
+                            "name": self.stage_dict["name"],
+                            "optimizer": self.stage_dict["classname"],
+                            "final_cost": prob.best_cost,
+                            "parameter_vector": list(prob.best_parameters),
+                            "parameters": {k: best_chain[k]["value"] for k in best_chain},
+                        }]
+                    }
+                    self.finished_signal.emit(result)
+                    return
             self.finished_signal.emit(e)
         finally:
             sys.stdout = old_stdout
@@ -321,6 +356,10 @@ class OptimizationProgressDialog(QDialog):
         self.stage = stage
         self.scan = scan
         self.optimization_result = None
+        
+        # Import and instantiate ANSI HTML Parser
+        from ct_recon_fdk_astra.gui.process_console import AnsiHtmlParser
+        self.ansi_parser = AnsiHtmlParser()
         
         # Layout
         layout = QVBoxLayout(self)
@@ -339,10 +378,19 @@ class OptimizationProgressDialog(QDialog):
         self.txt_console.setFont(QFont("Courier New", 10))
         layout.addWidget(self.txt_console)
         
-        # Buttons (only close or cancel)
+        # Buttons (Cancel/Discard and Apply)
+        btn_layout = QHBoxLayout()
+        
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.clicked.connect(self.cancel_optimization)
-        layout.addWidget(self.btn_cancel)
+        btn_layout.addWidget(self.btn_cancel)
+        
+        self.btn_apply = QPushButton("Apply")
+        self.btn_apply.setEnabled(False)
+        self.btn_apply.clicked.connect(self.accept)
+        btn_layout.addWidget(self.btn_apply)
+        
+        layout.addLayout(btn_layout)
         
         # Prepare Stage Dict
         chain = ParameterizationChain(stage.parameterizations)
@@ -369,27 +417,67 @@ class OptimizationProgressDialog(QDialog):
         
     def append_log(self, text):
         self.txt_console.moveCursor(self.txt_console.textCursor().MoveOperation.End)
-        self.txt_console.insertPlainText(text)
+        html_text = self.ansi_parser.parse(text)
+        self.txt_console.insertHtml(html_text)
         self.txt_console.moveCursor(self.txt_console.textCursor().MoveOperation.End)
         
+    def closeEvent(self, event):
+        if self.thread.isRunning():
+            self.cancel_optimization()
+            event.ignore()
+        else:
+            super().closeEvent(event)
+
     def cancel_optimization(self):
         if self.thread.isRunning():
-            self.thread.terminate() # Or stop/terminate safely
-            self.thread.wait()
-        self.reject()
+            self.lbl_status.setText("Cancelling optimization...")
+            if self.thread.calib and hasattr(self.thread.calib, "current_problem") and self.thread.calib.current_problem:
+                self.thread.calib.current_problem.is_cancelled = True
+        else:
+            self.reject()
         
     def on_finished(self, result):
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
-        self.btn_cancel.setEnabled(False)
         
         if isinstance(result, Exception):
             self.lbl_status.setText("Optimization failed.")
+            self.btn_cancel.setText("Close")
+            # If user clicked Cancel, the exception is likely the "cancelled by user" RuntimeError
+            if self.thread.calib and hasattr(self.thread.calib, "current_problem") and self.thread.calib.current_problem:
+                if self.thread.calib.current_problem.is_cancelled:
+                    self.reject()
+                    return
             QMessageBox.critical(self, "Optimization Error", f"An error occurred during optimization:\n{result}")
-            self.reject()
+            return
+            
+        if result.get("is_cancelled", False):
+            self.lbl_status.setText("Optimization cancelled.")
+            initial_cost = result["cost_history"][0] if result["cost_history"] else 0.0
+            best_cost = result["stages"][-1]["final_cost"]
+            
+            reply = QMessageBox.question(
+                self,
+                "Apply Best Parameters?",
+                f"Optimization was cancelled by the user.\n\n"
+                f"Initial Cost: {initial_cost:.6f}\n"
+                f"Best Cost Found: {best_cost:.6f}\n\n"
+                f"Would you like to apply the best parameters found so far to the current state?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.optimization_result = result
+                self.accept()
+            else:
+                self.reject()
             return
             
         self.lbl_status.setText("Optimization finished.")
+        self.btn_cancel.setText("Discard")
+        self.btn_apply.setEnabled(True)
+        self.btn_apply.setDefault(True)
+        self.optimization_result = result
         
         # Report the result of optimization
         initial_cost = result["cost_history"][0]
@@ -403,7 +491,6 @@ class OptimizationProgressDialog(QDialog):
             opt_params = last_stage.get("parameters", {})
             
             # Parse parameters to group _cpN suffixes
-            import re
             grouped_params = {} # prefix -> {index: value}
             single_params = {}  # name -> value
             
@@ -440,28 +527,16 @@ class OptimizationProgressDialog(QDialog):
                 param_lines.append(f"  • {name}: {formatted_val}")
                 
         params_str = "\n".join(param_lines) if param_lines else "  (No parameters)"
-
-        report_msg = (
+        
+        summary = (
+            f"\n\n========================================\n"
             f"Optimization of Stage '{self.stage.name}' completed successfully!\n\n"
             f"Optimized Parameters:\n{params_str}\n\n"
             f"ECC Cost: {initial_cost:.6e} → {final_cost:.6e}\n"
-            f"Time Taken: {time_taken:.2f} seconds\n\n"
-            "Do you wish to apply the changes to the current state?"
+            f"Time Taken: {time_taken:.2f} seconds\n"
+            f"========================================\n"
         )
-        
-        reply = QMessageBox.question(
-            self,
-            "Apply Optimization Results?",
-            report_msg,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes
-        )
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            self.optimization_result = result
-            self.accept()
-        else:
-            self.reject()
+        self.append_log(summary)
 
 
 class AutoConfigureResultDialog(QDialog):
@@ -511,8 +586,184 @@ class AutoConfigureResultDialog(QDialog):
         layout.addLayout(btn_layout)
         
     def open_report(self):
-        import webbrowser
         webbrowser.open("file://" + os.path.abspath(self.html_path))
+
+
+class AnalysisParametersDialog(QDialog):
+    """Dialog to query user for analysis parameters."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Configure Analysis Parameters")
+        self.setMinimumWidth(420)
+        
+        # Local import of QFormLayout to be safe
+        from PyQt6.QtWidgets import QFormLayout
+        
+        layout = QVBoxLayout(self)
+        form_layout = QFormLayout()
+        
+        # d_max
+        self.spin_d_max = QDoubleSpinBox()
+        self.spin_d_max.setRange(0.1, 1000.0)
+        self.spin_d_max.setValue(10.0)
+        self.spin_d_max.setDecimals(2)
+        form_layout.addRow("Expected Max Detector Motion (d_max, px):", self.spin_d_max)
+        
+        # num_samples
+        self.spin_num_samples = QSpinBox()
+        self.spin_num_samples.setRange(10, 1000000)
+        self.spin_num_samples.setValue(1000)
+        self.spin_num_samples.setSingleStep(100)
+        form_layout.addRow("Monte-Carlo Samples (num_samples):", self.spin_num_samples)
+        
+        # seed
+        self.spin_seed = QSpinBox()
+        self.spin_seed.setRange(0, 999999)
+        self.spin_seed.setValue(42)
+        form_layout.addRow("Random Seed (seed):", self.spin_seed)
+        
+        # delta_p
+        self.txt_delta_p = QLineEdit("1e-5")
+        form_layout.addRow("Derivative Perturbation (delta_p):", self.txt_delta_p)
+        
+        # max_epipolar_views
+        self.spin_max_views = QSpinBox()
+        self.spin_max_views.setRange(2, 10000)
+        self.spin_max_views.setValue(100)
+        form_layout.addRow("Max Epipolar Views (max_epipolar_views):", self.spin_max_views)
+        
+        # gap_threshold
+        self.spin_gap_threshold = QDoubleSpinBox()
+        self.spin_gap_threshold.setRange(1.0, 100000.0)
+        self.spin_gap_threshold.setValue(100.0)
+        self.spin_gap_threshold.setDecimals(1)
+        form_layout.addRow("Sloppy Gap Threshold (gap_threshold):", self.spin_gap_threshold)
+        
+        layout.addLayout(form_layout)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_ok = QPushButton("OK")
+        btn_ok.clicked.connect(self.validate_and_accept)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn_ok)
+        btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
+        
+    def validate_and_accept(self):
+        # Validate that delta_p is a valid float
+        val_str = self.txt_delta_p.text().strip()
+        try:
+            float(val_str)
+        except ValueError:
+            QMessageBox.critical(self, "Invalid Value", "Please enter a valid numeric value (e.g. 1e-5 or 0.00001) for delta_p.")
+            return
+        self.accept()
+        
+    def get_values(self):
+        return {
+            "d_max": self.spin_d_max.value(),
+            "num_samples": self.spin_num_samples.value(),
+            "seed": self.spin_seed.value(),
+            "delta_p": self.txt_delta_p.text().strip(),
+            "max_epipolar_views": self.spin_max_views.value(),
+            "gap_threshold": self.spin_gap_threshold.value()
+        }
+
+
+class AnalysisResultsDialog(QDialog):
+    """Dialog showing the outputs of geometric identifiability analysis,
+    with options to open directories/reports and apply recommendations."""
+    def __init__(self, parent, out_dir, html_path1, html_path2, suggested_json, abs_path):
+        super().__init__(parent)
+        self.setWindowTitle("Analysis Results")
+        self.setMinimumWidth(500)
+        self.out_dir = out_dir
+        self.html_path1 = html_path1
+        self.html_path2 = html_path2
+        self.suggested_json = suggested_json
+        self.abs_path = abs_path
+        
+        layout = QVBoxLayout(self)
+        
+        label_title = QLabel("<h3>Analysis Completed Successfully</h3>")
+        layout.addWidget(label_title)
+        
+        label_dir = QLabel(f"Output Directory:<br><code>{out_dir}</code>")
+        label_dir.setWordWrap(True)
+        label_dir.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(label_dir)
+        
+        layout.addSpacing(10)
+        
+        # Clickable buttons to open
+        btn_open_dir = QPushButton("Open Output Directory")
+        btn_open_dir.setStyleSheet("font-weight: bold; padding: 6px;")
+        btn_open_dir.clicked.connect(self.open_dir_action)
+        layout.addWidget(btn_open_dir)
+        
+        btn_open_html1 = QPushButton("Open Identifiability Report in Browser")
+        btn_open_html1.setStyleSheet("padding: 6px;")
+        btn_open_html1.clicked.connect(self.open_html1_action)
+        layout.addWidget(btn_open_html1)
+        
+        btn_open_html2 = QPushButton("Open Optimization Advisor Report in Browser")
+        btn_open_html2.setStyleSheet("padding: 6px;")
+        btn_open_html2.clicked.connect(self.open_html2_action)
+        layout.addWidget(btn_open_html2)
+        
+        layout.addSpacing(15)
+        
+        # Apply suggested config button
+        btn_apply = QPushButton("Apply Suggested Configuration to Stage")
+        btn_apply.setStyleSheet("font-weight: bold; background-color: #0284c7; color: white; padding: 8px;")
+        btn_apply.clicked.connect(self.apply_config_action)
+        layout.addWidget(btn_apply)
+        
+        layout.addSpacing(10)
+        
+        # Close button
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
+    def open_dir_action(self):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(self.out_dir))
+
+    def open_html1_action(self):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(self.html_path1))
+
+    def open_html2_action(self):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(self.html_path2))
+
+    def apply_config_action(self):
+        try:
+            if not os.path.exists(self.suggested_json):
+                QMessageBox.warning(self, "Apply Config Error", "Suggested configuration JSON file not found.")
+                return
+            
+            # Read suggested config
+            with open(self.suggested_json, 'r') as f:
+                suggested_data = json.load(f)
+                
+            # Overwrite original stage config file
+            with open(self.abs_path, 'w') as f:
+                json.dump(suggested_data, f, indent=2)
+                
+            # Reload stage in GUI
+            if self.parent():
+                stage_obj = self.parent().load_stage_file(self.abs_path)
+                if stage_obj:
+                    self.parent().stages_cache[self.abs_path] = stage_obj
+                    self.parent().select_stage(self.parent().list_stages.currentRow())
+                    self.parent().update_json_preview()
+                    
+            QMessageBox.information(self, "Success", "Suggested configuration successfully applied and reloaded!")
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "Apply Config Error", f"Failed to apply suggested config:\n{e}")
 
 
 class SweepWindow(QMainWindow):
@@ -642,7 +893,7 @@ class Sweep2DWindow(QMainWindow):
 
 
 class Stage:
-    def __init__(self, name="Optimization Stage", optimizer="OptimizerPowell", maxiter=200, ftol=1e-12):
+    def __init__(self, name="Optimization Stage", optimizer="OptimizerPowell", maxiter=200, ftol=1e-6):
         self.name = name
         self.optimizer = optimizer
         self.maxiter = maxiter
@@ -769,13 +1020,11 @@ def _peek_image_size(image_path):
     path = str(image_path)
     try:
         if path.lower().endswith('.nrrd'):
-            import nrrd
             _, hdr = nrrd.read(path, index_order='C')
             # NRRD sizes field: (W, H, [slices])
             sizes = hdr.get('sizes', [0, 0])
             return int(sizes[0]), int(sizes[1])
         else:
-            from PIL import Image as PILImage
             with PILImage.open(path) as img:
                 return img.size  # (W, H)
     except Exception:
@@ -824,7 +1073,6 @@ class ConfigLoadDialog(QDialog):
             first_abs = first if os.path.isabs(first) else os.path.join(data_dir, first)
             if is_stack:
                 try:
-                    import nrrd
                     _, hdr = nrrd.read(first_abs, index_order='C')
                     sizes = hdr.get('sizes', [0, 0, 0])
                     self._img_w  = int(sizes[0])
@@ -1036,7 +1284,7 @@ class GeometryCorrectionGUI(QMainWindow):
         self.resize(1300, 850)
         
         self.P_list = []           # List of original matrices
-        self.P_list_undersampled = [] # Undersampled trajectory
+        self.P_list_original = []  # Backup of full trajectory
         self.images_undersampled = [] # Undersampled images
         self.voxel_dimensions = [100, 100, 100]
         self.model_matrix = np.eye(4)
@@ -1051,6 +1299,11 @@ class GeometryCorrectionGUI(QMainWindow):
         self.stages_cache = {}      # mapping abs_path -> Stage
         self.initial_stages_to_check = []
         self.sweep_windows = []
+        self.raw_images = None
+        self.console_win = None
+        self.recon_console_win = None
+        self.sweep_param_instances = {}
+        self.cost_matrix = None
         
         self.clicked_point_viewport = None
         self.clicked_point_coords   = None
@@ -1067,6 +1320,17 @@ class GeometryCorrectionGUI(QMainWindow):
         
         # Load default stage configuration to start with
         self.load_default_stages()
+
+    @property
+    def P_list_undersampled(self):
+        if not getattr(self, 'P_list', None):
+            return []
+        U = self.spin_undersample.value() if hasattr(self, 'spin_undersample') else 1
+        Ps = self.P_list[::U]
+        imgs = getattr(self, 'images_undersampled', None)
+        if imgs is not None:
+            Ps = Ps[:len(imgs)]
+        return Ps
 
     def init_ui(self):
         self.tabs = QTabWidget()
@@ -1259,6 +1523,10 @@ class GeometryCorrectionGUI(QMainWindow):
         btn_import_stage.clicked.connect(self.import_stage_action)
         btn_export_stage = QPushButton("Export...")
         btn_export_stage.clicked.connect(self.export_stage_action)
+        btn_analyze_stage = QPushButton("Analyze...")
+        btn_analyze_stage.setStyleSheet("font-weight: bold; background-color: #16a085; color: white;")
+        btn_analyze_stage.clicked.connect(self.analyze_stage_action)
+
         btn_optimize_stage = QPushButton("Optimize...")
         btn_optimize_stage.setStyleSheet("font-weight: bold; background-color: #0284c7; color: white;")
         btn_optimize_stage.clicked.connect(self.optimize_stage_action)
@@ -1266,6 +1534,7 @@ class GeometryCorrectionGUI(QMainWindow):
         btn_stages_v_lay.addSpacing(6)
         btn_stages_v_lay.addWidget(btn_import_stage)
         btn_stages_v_lay.addWidget(btn_export_stage)
+        btn_stages_v_lay.addWidget(btn_analyze_stage)
         btn_stages_v_lay.addWidget(btn_optimize_stage)
         btn_stages_v_lay.addStretch()
         
@@ -1296,7 +1565,7 @@ class GeometryCorrectionGUI(QMainWindow):
         self.txt_ftol = QDoubleSpinBox()
         self.txt_ftol.setDecimals(15)
         self.txt_ftol.setRange(1e-18, 1.0)
-        self.txt_ftol.setValue(1e-12)
+        self.txt_ftol.setValue(1e-6)
         self.txt_ftol.setSingleStep(1e-5)
         self.txt_ftol.valueChanged.connect(self.update_stage_ftol)
         opt_settings_lay.addWidget(self.txt_ftol)
@@ -1599,20 +1868,14 @@ class GeometryCorrectionGUI(QMainWindow):
                 event.ignore()
                 return
 
-        if hasattr(self, 'console_win') and self.console_win:
-            try:
-                if not self.console_win.close():
-                    event.ignore()
-                    return
-            except Exception:
-                pass
-        if hasattr(self, 'recon_console_win') and self.recon_console_win:
-            try:
-                if not self.recon_console_win.close():
-                    event.ignore()
-                    return
-            except Exception:
-                pass
+        if self.console_win:
+            if not self.console_win.close():
+                event.ignore()
+                return
+        if self.recon_console_win:
+            if not self.recon_console_win.close():
+                event.ignore()
+                return
         if getattr(self, 'parent_window', None) is not None:
             self.parent_window.show()
         super().closeEvent(event)
@@ -1653,6 +1916,10 @@ class GeometryCorrectionGUI(QMainWindow):
         reapply_action = QAction("Re-Apply Existing Parameterization...", self)
         reapply_action.triggered.connect(self.reapply_parameterization_action)
         file_menu.addAction(reapply_action)
+        
+        reset_state_action = QAction("Reset Current State", self)
+        reset_state_action.triggered.connect(self.reset_current_state_action)
+        file_menu.addAction(reset_state_action)
         file_menu.addSeparator()
         
         exit_action = QAction("Exit", self)
@@ -1750,7 +2017,6 @@ class GeometryCorrectionGUI(QMainWindow):
         self.table_param_details.blockSignals(True)
         
         # Group parameters ending in _cp{i}
-        import re
         cp_pattern = re.compile(r'^(.*)_cp(\d+)$')
         
         rows_to_display = []
@@ -1890,7 +2156,6 @@ class GeometryCorrectionGUI(QMainWindow):
             if reply == QMessageBox.StandardButton.Yes:
                 # Create a temporary chain with only this parameterization set to v_opt
                 # (and other parameters set to 0.0)
-                from copy import deepcopy
                 param_obj_opt = deepcopy(param_obj)
                 for k in param_obj_opt.parameters:
                     if k == param_name:
@@ -1903,11 +2168,10 @@ class GeometryCorrectionGUI(QMainWindow):
                 # Apply transformation permanently to all matrices in memory
                 self.P_list = single_chain.apply_to_trajectory(self.P_list)
                 self.dirty = True
-                U = self.spin_undersample.value()
-                self.P_list_undersampled = self.P_list[::U]
                 
                 # Apply to scan
-                self.scan.set_projection_matrices(self.P_list_undersampled)
+                if self.scan:
+                    self.scan.set_projection_matrices(self.P_list_undersampled)
                 
                 # Reset this parameter value in the UI to 0.0
                 p_info["value"] = 0.0
@@ -2082,7 +2346,6 @@ class GeometryCorrectionGUI(QMainWindow):
             self.update_json_preview()
 
     def duplicate_stage_action(self):
-        from copy import deepcopy
         row = self.list_stages.currentRow()
         if row < 0 or row >= self.list_stages.count():
             QMessageBox.warning(self, "No Selection", "Please select a stage to duplicate.")
@@ -2191,7 +2454,6 @@ class GeometryCorrectionGUI(QMainWindow):
             return
         
         # Show a context menu of available parameterizations
-        from PyQt6.QtWidgets import QMenu
         menu = QMenu(self)
         for label, cls in AVAILABLE_PARAMS.items():
             act = QAction(label, self)
@@ -2274,7 +2536,7 @@ class GeometryCorrectionGUI(QMainWindow):
             self.update_json_preview()
 
     def reapply_parameterization_action(self):
-        if not hasattr(self, "P_list") or not self.P_list:
+        if not self.P_list:
             QMessageBox.warning(self, "No Trajectory Loaded", "Please load a reconstruction config with a trajectory first.")
             return
 
@@ -2337,9 +2599,6 @@ class GeometryCorrectionGUI(QMainWindow):
                 self.P_list = param_obj.apply_to_trajectory(self.P_list)
                 self.dirty = True
                 
-                U = self.spin_undersample.value()
-                self.P_list_undersampled = self.P_list[::U]
-                
                 if self.scan:
                     self.scan.set_projection_matrices(self.P_list_undersampled)
                     
@@ -2349,6 +2608,16 @@ class GeometryCorrectionGUI(QMainWindow):
                 
         except Exception as e:
             QMessageBox.critical(self, "Error Loading Parameterization", f"Failed to load or apply parameterization:\n{e}")
+
+    def reset_current_state_action(self):
+        traj_path = os.path.normpath(os.path.join(os.path.dirname(self.txt_out_dir.text().strip()), "trajectory.ompl"))
+        self.P_list = load_ompl(traj_path)
+        self.P_list_original = list(self.P_list)
+        self.load_and_undersample()
+        for s in self.stages_cache.values():
+            for p in s.parameterizations:
+                for k in p.parameters: p.parameters[k]["value"] = 0.0
+        self.select_stage(self.list_stages.currentRow())
 
     def auto_configure_action(self):
         stage, stage_path = self.get_active_stage()
@@ -2767,14 +3036,11 @@ class GeometryCorrectionGUI(QMainWindow):
             self.P_list = new_P
             self.P_list_original = list(new_P)
             self.dirty = True
-            U = self.spin_undersample.value()
-            self.P_list_undersampled = self.P_list[::U]
             if self.scan:
                 self.scan.set_projection_matrices(self.P_list_undersampled)
             self.render_viewports()
             self.statusBar().showMessage(f"Loaded OMPL trajectory ({len(new_P)} views) from: {file_path}")
         except Exception as e:
-            import traceback
             QMessageBox.critical(self, "Load OMPL Error", f"Failed to load OMPL file:\n{traceback.format_exc()}")
 
     def save_ompl_action(self):
@@ -2802,7 +3068,6 @@ class GeometryCorrectionGUI(QMainWindow):
             )
             self.statusBar().showMessage(f"Saved OMPL trajectory ({len(self.P_list)} views) to: {file_path}")
         except Exception as e:
-            import traceback
             QMessageBox.critical(self, "Save OMPL Error", f"Failed to save OMPL file:\n{traceback.format_exc()}")
 
     def save_project_action(self):
@@ -2833,7 +3098,6 @@ class GeometryCorrectionGUI(QMainWindow):
             self.statusBar().showMessage(f"Project saved successfully to {out_dir}", 5000)
             return True
         except Exception as e:
-            import traceback
             QMessageBox.critical(self, "Save Error", f"Failed to save trajectory.ompl:\n{traceback.format_exc()}")
             return False
 
@@ -2878,7 +3142,6 @@ class GeometryCorrectionGUI(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return
         try:
-            import shutil
             shutil.copy2(file_path, dest)
             self.scan_stages_directory(stages_dir)
             self.statusBar().showMessage(f"Imported stage: {dest}")
@@ -2987,8 +3250,6 @@ class GeometryCorrectionGUI(QMainWindow):
             self.update_json_preview()
 
     def compute_default_output_dir(self, recon_path):
-        import datetime
-        import re
         if not recon_path or not os.path.exists(recon_path):
             return ""
         recon_path_abs = os.path.abspath(recon_path)
@@ -3220,8 +3481,6 @@ class GeometryCorrectionGUI(QMainWindow):
             self.txt_out_dir.setText(dir_path)
 
     def reveal_out_dir(self):
-        from PyQt6.QtGui import QDesktopServices
-        from PyQt6.QtCore import QUrl
         out_dir = self.txt_out_dir.text().strip()
         if not out_dir:
             self.statusBar().showMessage("No output directory set.")
@@ -3244,7 +3503,7 @@ class GeometryCorrectionGUI(QMainWindow):
             recon_dir = os.path.dirname(os.path.abspath(recon_config_path)) if recon_config_path else os.getcwd()
             
             # Load OMPL trajectory (cached)
-            if not hasattr(self, 'P_list') or not self.P_list:
+            if not self.P_list:
                 # Check for existing OMPL files in the output directory in priority order
                 opt_ompl_path = None
                 out_dir = self.txt_out_dir.text().strip()
@@ -3277,10 +3536,9 @@ class GeometryCorrectionGUI(QMainWindow):
             
             # Perform undersampling
             U = self.spin_undersample.value()
-            self.P_list_undersampled = self.P_list[::U]
             
             # Load images (cached)
-            if not hasattr(self, 'raw_images') or self.raw_images is None or len(self.raw_images) == 0:
+            if not self.raw_images:
                 image_files = config.get("image_files", [])
                 data_dir = config.get("data_dir", "./")
                 if os.path.isabs(data_dir):
@@ -3290,7 +3548,6 @@ class GeometryCorrectionGUI(QMainWindow):
                 
                 raw_images = []
                 if len(image_files) == 1 and image_files[0].lower().endswith('.nrrd'):
-                    import nrrd
                     if os.path.isabs(image_files[0]):
                         image_path = image_files[0]
                     else:
@@ -3300,14 +3557,12 @@ class GeometryCorrectionGUI(QMainWindow):
                     projs = np.transpose(data, (2, 1, 0))
                     raw_images = [projs[i] for i in range(projs.shape[0])]
                 else:
-                    from tifffile import imread
                     for img_name in image_files:
                         if os.path.isabs(img_name):
                             img_path = img_name
                         else:
                             img_path = os.path.normpath(os.path.join(data_dir_path, img_name))
                         if img_path.lower().endswith('.nrrd'):
-                            import nrrd
                             img, _ = nrrd.read(img_path)
                             img = np.squeeze(img)
                             if img.ndim == 2:
@@ -3322,7 +3577,6 @@ class GeometryCorrectionGUI(QMainWindow):
             
             # Crop trajectory lists if sizes mismatch
             min_size = min(len(self.P_list_undersampled), len(self.images_undersampled))
-            self.P_list_undersampled = self.P_list_undersampled[:min_size]
             self.images_undersampled = self.images_undersampled[:min_size]
             
             # Instantiate Scan object
@@ -3717,7 +3971,6 @@ class GeometryCorrectionGUI(QMainWindow):
             pil_img = Image.fromarray(img_norm)
             
             # Create Composer with canvas dimensions and add the image manually with explicit width/height
-            from svg_snip.Composer import image as svg_image
             svg = Composer((W, H))
             svg.add(svg_image, data=pil_img, width=W, height=H)
             
@@ -3727,7 +3980,6 @@ class GeometryCorrectionGUI(QMainWindow):
             family_color = "#2dff5560" if is_view1 else "#ff2d5560"
             
             # Draw border rectangle using rect from svg_snip.Elements
-            from svg_snip.Elements import rect
             svg.add(rect, x=0, y=0, width=W, height=H, stroke=border_color, stroke_width=5, fill="none")
             
             # Accumulate all parameterizations up to the active stage/chain
@@ -3861,7 +4113,6 @@ class GeometryCorrectionGUI(QMainWindow):
             dtr_svg = Composer((size_alpha, size_t))
             
             # Add background image
-            from svg_snip.Composer import image as svg_image
             dtr_svg.add(svg_image, data=pil_dtr, width=size_alpha, height=size_t)
             
             # Get project image size for Radon mapping
@@ -3909,7 +4160,6 @@ class GeometryCorrectionGUI(QMainWindow):
                 
             # Draw the curve as a polyline
             pts_str = " ".join([f"{a:.2f},{t:.2f}" for a, t in pts_list])
-            from svg_snip.Elements import polyline
             curve_color = "green" if is_view1 else "red"
             dtr_svg.add(polyline, points=pts_str, stroke=curve_color, stroke_width=2.0, fill="none")
             
@@ -4027,8 +4277,7 @@ class GeometryCorrectionGUI(QMainWindow):
         self.combo_2d_class1.clear()
         self.combo_2d_class2.clear()
         
-        if not hasattr(self, 'sweep_param_instances'):
-            self.sweep_param_instances = {}
+
             
         # First, scan stage parameterizations and update our instances pool
         if stage:
@@ -4036,8 +4285,6 @@ class GeometryCorrectionGUI(QMainWindow):
                 self.sweep_param_instances[p_obj.__class__] = p_obj
                 
         # Now, populate dropdowns with all non-TimeVariant classes from AVAILABLE_PARAMS
-        from xray_epipolar_consistency.parameterization.time_variant import TimeVariant
-        
         for label, cls in AVAILABLE_PARAMS.items():
             if issubclass(cls, TimeVariant):
                 continue
@@ -4329,7 +4576,7 @@ class GeometryCorrectionGUI(QMainWindow):
         i < j is a valid upper-triangle entry."""
         if event.xdata is None or event.ydata is None:
             return
-        if not hasattr(self, 'cost_matrix') or self.cost_matrix is None:
+        if self.cost_matrix is None:
             return
 
         j = int(round(event.xdata))   # column → view index 2
@@ -4407,7 +4654,6 @@ class GeometryCorrectionGUI(QMainWindow):
             # Update stages directory to be next to the new config path if needed
             stages_dir = os.path.join(config_dir, "stages")
             if os.path.exists(stages_dir):
-                import shutil
                 try:
                     shutil.rmtree(stages_dir)
                 except Exception:
@@ -4471,7 +4717,6 @@ class GeometryCorrectionGUI(QMainWindow):
                     data_dir_path_abs = os.path.normpath(os.path.join(recon_dir, data_dir))
                 
                 if len(orig_image_files) == 1 and orig_image_files[0].lower().endswith('.nrrd'):
-                    import nrrd
                     orig_nrrd_path = os.path.join(data_dir_path_abs, orig_image_files[0])
                     data, header = nrrd.read(orig_nrrd_path)
                     data_sliced = data[:, :, ::U]
@@ -4560,13 +4805,6 @@ class GeometryCorrectionGUI(QMainWindow):
             print(f"Failed to print geometry correction JSON: {e}")
             
         # Spawn process console window
-        try:
-            from ct_recon_fdk_astra.gui.process_console import ProcessConsoleWindow
-        except ImportError:
-            try:
-                from gui.process_console import ProcessConsoleWindow
-            except ImportError:
-                from reconstruct.gui.process_console import ProcessConsoleWindow
             
         cmd = f'"{sys.executable}" -u -m xray_epipolar_consistency.tools.geometry_correction "{config_path}"'
         self.console_win = ProcessConsoleWindow(
@@ -4638,9 +4876,6 @@ class GeometryCorrectionGUI(QMainWindow):
                     self.P_list = opt_chain.apply_to_trajectory(self.P_list)
                     self.dirty = True
                     
-                    # Update undersampled trajectory
-                    U = self.spin_undersample.value()
-                    self.P_list_undersampled = self.P_list[::U]
                     if self.scan:
                         self.scan.set_projection_matrices(self.P_list_undersampled)
                         
@@ -4669,6 +4904,110 @@ class GeometryCorrectionGUI(QMainWindow):
                     self.statusBar().showMessage("Applied optimization results to the current state.", 5000)
                 except Exception as e:
                     QMessageBox.critical(self, "Application Error", f"Failed to apply optimization results:\n{e}")
+
+    def analyze_stage_action(self):
+        stage, abs_path = self.get_active_stage()
+        if not stage:
+            QMessageBox.warning(self, "No Stage Selected", "Please select a stage to analyze.")
+            return
+            
+        if not self.current_config_path:
+            QMessageBox.warning(self, "No Dataset Loaded", "Please load a dataset configuration first.")
+            return
+
+        recon_config_abs = self.original_recon_config_path or self.txt_recon_path.text()
+        if not recon_config_abs or not os.path.exists(recon_config_abs):
+            QMessageBox.warning(self, "No Reconstruction Config", "Could not locate the original reconstruction.json file.")
+            return
+
+        # Query user for analysis parameters
+        dialog_param = AnalysisParametersDialog(self)
+        if dialog_param.exec() != QDialog.DialogCode.Accepted:
+            return
+        params = dialog_param.get_values()
+
+        # Save stage config to disk first to capture latest UI changes
+        self.save_single_stage(abs_path, stage)
+
+        # Output directory is 'analysis' folder inside current_config's parent
+        out_dir = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(self.current_config_path)), "analysis"))
+        os.makedirs(out_dir, exist_ok=True)
+
+        # Show progress dialog
+        progress = QProgressDialog("Running geometric identifiability & advisor analysis...", "Cancel", 0, 100, self)
+        progress.setWindowTitle("Geometric Analysis")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(5)
+        QApplication.processEvents()
+
+        try:
+            import shutil
+            # Resolve executable commands
+            exe_ident = shutil.which("sloppy-direction-analysis")
+            if not exe_ident:
+                p = os.path.join(os.path.dirname(sys.executable), "sloppy-direction-analysis")
+                exe_ident = p if os.path.exists(p) else "sloppy-direction-analysis"
+
+            exe_advisor = shutil.which("optimization-advisor")
+            if not exe_advisor:
+                p = os.path.join(os.path.dirname(sys.executable), "optimization-advisor")
+                exe_advisor = p if os.path.exists(p) else "optimization-advisor"
+
+            # Run sloppy direction analysis
+            progress.setValue(20)
+            progress.setLabelText("Running Sloppy Direction Analysis...")
+            QApplication.processEvents()
+            
+            cmd_ident = [
+                exe_ident,
+                recon_config_abs,
+                abs_path,
+                "--output_dir", out_dir,
+                "--num_samples", str(params["num_samples"]),
+                "--seed", str(params["seed"]),
+                "--delta_p", str(params["delta_p"]),
+                "--max_epipolar_views", str(params["max_epipolar_views"]),
+                "--gap_threshold", str(params["gap_threshold"])
+            ]
+            res_ident = subprocess.run(cmd_ident, capture_output=True, text=True)
+            if res_ident.returncode != 0:
+                raise RuntimeError(f"Sloppy Direction Analysis failed:\n{res_ident.stderr}")
+
+            # Run optimization advisor
+            progress.setValue(60)
+            progress.setLabelText("Running Optimization Advisor...")
+            QApplication.processEvents()
+
+            cmd_advisor = [
+                exe_advisor,
+                recon_config_abs,
+                abs_path,
+                "--output_dir", out_dir,
+                "--d_max", str(params["d_max"]),
+                "--num_samples", str(params["num_samples"]),
+                "--seed", str(params["seed"]),
+                "--delta_p", str(params["delta_p"]),
+                "--max_epipolar_views", str(params["max_epipolar_views"])
+            ]
+            res_advisor = subprocess.run(cmd_advisor, capture_output=True, text=True)
+            if res_advisor.returncode != 0:
+                raise RuntimeError(f"Optimization Advisor failed:\n{res_advisor.stderr}")
+
+            progress.setValue(100)
+            progress.close()
+
+            # Show results dialog
+            html_path1 = os.path.join(out_dir, "report_identifiability.html")
+            html_path2 = os.path.join(out_dir, "report_optimization_advisor.html")
+            suggested_json = os.path.join(out_dir, "suggested_optimizer_config.json")
+            
+            dlg = AnalysisResultsDialog(self, out_dir, html_path1, html_path2, suggested_json, abs_path)
+            dlg.exec()
+            
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(self, "Analysis Failed", f"An error occurred during analysis:\n{e}")
 
     def run_reconstruction_action(self):
         if not self.current_recon_json:
@@ -4867,14 +5206,6 @@ class GeometryCorrectionGUI(QMainWindow):
             if reconstruct_file.endswith('.pyc'):
                 reconstruct_file = reconstruct_file[:-1]
                 
-            try:
-                from ct_recon_fdk_astra.gui.process_console import ProcessConsoleWindow
-            except ImportError:
-                try:
-                    from gui.process_console import ProcessConsoleWindow
-                except ImportError:
-                    from reconstruct.gui.process_console import ProcessConsoleWindow
-                
             cmd = f'"{sys.executable}" -u "{reconstruct_file}" "{new_recon_json_path}"'
             self.recon_console_win = ProcessConsoleWindow(
                 command=cmd,
@@ -4892,13 +5223,11 @@ class GeometryCorrectionGUI(QMainWindow):
             self.statusBar().showMessage(f"Reconstruction started: {new_recon_json_path}")
 
         except Exception as e:
-            import traceback
             QMessageBox.critical(self, "Reconstruction Error", f"Failed to start reconstruction:\n{traceback.format_exc()}")
             self.show()
 
     def resolve_reconstruct_file(self):
         try:
-            import reconstruct
             return os.path.abspath(reconstruct.__file__)
         except Exception:
             pass
@@ -4916,17 +5245,6 @@ class GeometryCorrectionGUI(QMainWindow):
 
     def resolve_nrrd_view_3d_file(self):
         try:
-            import ct_recon_fdk_astra.gui.nrrd_view_3d as nrrd_view_3d
-            return os.path.abspath(nrrd_view_3d.__file__)
-        except Exception:
-            pass
-        try:
-            import gui.nrrd_view_3d as nrrd_view_3d
-            return os.path.abspath(nrrd_view_3d.__file__)
-        except Exception:
-            pass
-        try:
-            import reconstruct.gui.nrrd_view_3d as nrrd_view_3d
             return os.path.abspath(nrrd_view_3d.__file__)
         except Exception:
             pass
@@ -4969,7 +5287,6 @@ class GeometryCorrectionGUI(QMainWindow):
             
             # Resolve nrrd_view_3d.py or fallback
             nrrd_view_3d_file = self.resolve_nrrd_view_3d_file()
-            import subprocess
             if nrrd_view_3d_file:
                 cmd = [sys.executable, nrrd_view_3d_file] + abs_paths
             else:
@@ -4991,13 +5308,6 @@ class GeometryCorrectionGUI(QMainWindow):
                     output_file = os.path.join(os.path.dirname(config_path), output_file)
                 output_file = os.path.normpath(output_file)
                 if os.path.exists(output_file):
-                    try:
-                        from ct_recon_fdk_astra.gui.nrrd_view_3d import NrrdView3DWindow
-                    except ImportError:
-                        try:
-                            from gui.nrrd_view_3d import NrrdView3DWindow
-                        except ImportError:
-                            from reconstruct.gui.nrrd_view_3d import NrrdView3DWindow
                     self.nrrd_win = NrrdView3DWindow()
                     self.nrrd_win.show()
                     self.nrrd_win.open_file(output_file)
@@ -5007,7 +5317,6 @@ class GeometryCorrectionGUI(QMainWindow):
                         f"Reconstruction finished but output file not found:\n{output_file}"
                     )
             except Exception as ex:
-                import traceback
                 QMessageBox.critical(self, "Post-Reconstruction Error",
                                      f"Failed to open NrrdView3D:\n{traceback.format_exc()}")
         else:
@@ -5020,7 +5329,6 @@ class GeometryCorrectionGUI(QMainWindow):
                 out_dir = self.txt_out_dir.text().strip()
                 report_path = os.path.join(out_dir, "report.html")
                 if os.path.exists(report_path):
-                    import webbrowser
                     webbrowser.open(os.path.abspath(report_path))
             except Exception as e:
                 print(f"Failed to open report in browser: {e}")
@@ -5056,13 +5364,6 @@ class GeometryCorrectionGUI(QMainWindow):
                         print(f"Error resolving reconstructed paths in GUI: {e}")
                 
                 if os.path.exists(recon_misaligned) and os.path.exists(recon_optimized):
-                    try:
-                        from ct_recon_fdk_astra.gui.nrrd_view_3d import NrrdView3DWindow
-                    except ImportError:
-                        try:
-                            from gui.nrrd_view_3d import NrrdView3DWindow
-                        except ImportError:
-                            from reconstruct.gui.nrrd_view_3d import NrrdView3DWindow
                     class InteractiveNrrdView3DWindow(NrrdView3DWindow):
                         def __init__(self, parent_window):
                             self.parent_window = parent_window
@@ -5094,7 +5395,7 @@ class GeometryCorrectionGUI(QMainWindow):
         opt_param_path = os.path.join(out_dir, "parameterization.json")
         
         # Ensure we have the original full trajectory loaded
-        if not hasattr(self, 'P_list_original') or not self.P_list_original:
+        if not self.P_list_original:
             self.P_list_original = list(self.P_list)
             
         if os.path.exists(opt_param_path):
@@ -5116,8 +5417,6 @@ class GeometryCorrectionGUI(QMainWindow):
                     detector_size_px=self.P_list_original[0].image_size
                 )
                 
-                U = self.spin_undersample.value()
-                self.P_list_undersampled = self.P_list[::U]
                 if self.scan:
                     self.scan.set_projection_matrices(self.P_list_undersampled)
                 
