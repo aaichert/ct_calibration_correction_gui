@@ -2863,7 +2863,7 @@ class GeometryCorrectionGUI(QMainWindow):
             
             # Input data
             U = self.spin_undersample.value()
-            undersampled_recon_filename = f"fullscan_{len(self.P_list_undersampled) or 'N'}views_600x400.json"
+            undersampled_recon_filename = "subsampled.json"
             
             # Reconstruction Config
             recon_path = self.txt_recon_path.text().strip()
@@ -4747,11 +4747,11 @@ class GeometryCorrectionGUI(QMainWindow):
                 
             if self.current_recon_json:
                 U = self.spin_undersample.value()
-                undersampled_recon_filename = f"fullscan_{len(self.P_list_undersampled)}views_600x400.json"
+                undersampled_recon_filename = "subsampled.json"
                 undersampled_recon_path = os.path.join(config_dir, undersampled_recon_filename)
                 
                 # Construct the undersampled trajectory details
-                undersampled_ompl_filename = f"fullscan_{len(self.P_list_undersampled)}views_600x400.ompl"
+                undersampled_ompl_filename = "subsampled.ompl"
                 undersampled_ompl_path = os.path.join(config_dir, undersampled_ompl_filename)
                 save_ompl(
                     self.P_list_undersampled,
@@ -4775,7 +4775,7 @@ class GeometryCorrectionGUI(QMainWindow):
                     data, header = nrrd.read(orig_nrrd_path)
                     data_sliced = data[:, :, ::U]
                     
-                    undersampled_nrrd_filename = f"fullscan_{len(self.P_list_undersampled)}views_600x400.nrrd"
+                    undersampled_nrrd_filename = "subsampled.nrrd"
                     undersampled_nrrd_path = os.path.join(config_dir, undersampled_nrrd_filename)
                     nrrd.write(undersampled_nrrd_path, data_sliced, header)
                     
