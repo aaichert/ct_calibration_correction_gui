@@ -3890,11 +3890,23 @@ class GeometryCorrectionGUI(QMainWindow):
         P2 = P2_obj.P
         C2 = P2_obj.getCenterOfProjection().flatten()
         
-        # Baseline joining camera centers
-        B = pluecker.join_points(C1, C2)
-        Bx_dual = pluecker.matrixDual(B)
-        E0 = pluecker.join(B, np.array([0, 0, 0, 1]))
-        E90 = Bx_dual @ Bx_dual @ np.array([0, 0, 0, 1])
+        # Baseline joining camera centers (apply T_norm normalization if available to match GPU metric)
+        if self.scan is not None and hasattr(self.scan, 'T_norm') and self.scan.T_norm is not None:
+            T_norm_inv = np.linalg.inv(self.scan.T_norm)
+            C1_norm = T_norm_inv @ C1
+            C2_norm = T_norm_inv @ C2
+            B_norm = pluecker.join_points(C1_norm, C2_norm)
+            Bx_dual_norm = pluecker.matrixDual(B_norm)
+            E0_norm = pluecker.join(B_norm, np.array([0, 0, 0, 1]))
+            E90_norm = Bx_dual_norm @ Bx_dual_norm @ np.array([0, 0, 0, 1])
+            E0 = T_norm_inv.T @ E0_norm
+            E90 = T_norm_inv.T @ E90_norm
+        else:
+            B = pluecker.join_points(C1, C2)
+            Bx_dual = pluecker.matrixDual(B)
+            E0 = pluecker.join(B, np.array([0, 0, 0, 1]))
+            E90 = Bx_dual @ Bx_dual @ np.array([0, 0, 0, 1])
+            
         E0 = hessianNormalForm(E0).flatten()
         E90 = hessianNormalForm(E90).flatten()
         K_pencil = np.column_stack([E0, E90])
