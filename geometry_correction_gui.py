@@ -2082,7 +2082,7 @@ class GeometryCorrectionGUI(QMainWindow):
             # Optimize (Checkbox)
             chk = QCheckBox()
             chk.setChecked(row_data["config"].get("opt", False))
-            chk.stateChanged.connect(lambda state, n=row_data["display_name"], p=param_obj: self.on_param_opt_changed(n, p, state))
+            chk.checkStateChanged.connect(lambda state, n=row_data["display_name"], p=param_obj: self.on_param_opt_changed(n, p, state))
             self.table_param_details.setCellWidget(idx, 1, chk)
             
             # Range Min
@@ -2197,13 +2197,17 @@ class GeometryCorrectionGUI(QMainWindow):
             QMessageBox.critical(self, "1D Search Error", f"Failed to perform 1D search:\n{e}")
 
     def on_param_opt_changed(self, name, param_obj, state):
-        opt_val = (state == Qt.CheckState.Checked.value)
+        opt_val = (state == Qt.CheckState.Checked)
         prefix = name.split("[")[0] if "[" in name else name
         for k in param_obj.parameters:
             if k.startswith(prefix):
                 param_obj.parameters[k]["opt"] = opt_val
         self.render_viewports()
         self.update_json_preview()
+        
+        stage, abs_path = self.get_active_stage()
+        if stage and abs_path:
+            self.save_single_stage(abs_path, stage)
 
     def on_param_val_changed(self, name, param_obj, val):
         prefix = name.split("[")[0] if "[" in name else name
@@ -2213,6 +2217,10 @@ class GeometryCorrectionGUI(QMainWindow):
 
         self.render_viewports()
         self.update_json_preview()
+        
+        stage, abs_path = self.get_active_stage()
+        if stage and abs_path:
+            self.save_single_stage(abs_path, stage)
 
     def on_param_range_changed(self, name, param_obj, val, is_min):
         prefix = name.split("[")[0] if "[" in name else name
@@ -2225,6 +2233,10 @@ class GeometryCorrectionGUI(QMainWindow):
                     r[1] = val
                 param_obj.parameters[k]["range"] = tuple(r)
         self.update_json_preview()
+        
+        stage, abs_path = self.get_active_stage()
+        if stage and abs_path:
+            self.save_single_stage(abs_path, stage)
 
     def apply_auto_range(self, row_data, param_obj, option):
         if option == "-":
@@ -2273,6 +2285,10 @@ class GeometryCorrectionGUI(QMainWindow):
             self.select_parameterization(current_row)
             
         self.update_json_preview()
+        
+        stage, abs_path = self.get_active_stage()
+        if stage and abs_path:
+            self.save_single_stage(abs_path, stage)
 
     def add_stage_action(self):
         stages_dir = self.txt_stages_dir.text()
@@ -2765,8 +2781,13 @@ class GeometryCorrectionGUI(QMainWindow):
 
         # 2. Get output directory
         out_dir = self.txt_out_dir.text().strip()
-        if not out_dir or out_dir == "Select Output Folder" or not os.path.exists(out_dir):
+        if not out_dir or out_dir == "Select Output Folder":
             out_dir = os.getcwd()
+        else:
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+            except Exception:
+                out_dir = os.getcwd()
 
         # 3. Determine actual stage name (filename without extension)
         stage_filename = os.path.basename(stage_path)
@@ -3744,7 +3765,7 @@ class GeometryCorrectionGUI(QMainWindow):
                 a_px = a_val * (size_alpha - 1)
                 t_px = t_val * (size_t - 1)
                 dot = (
-                    f'<circle cx="{a_px:.2f}" cy="{t_px:.2f}" r="6" '
+                    f'<circle cx="{a_px:.2f}" cy="{t_px:.2f}" r="12" '
                     f'fill="none" stroke="#00eeff" stroke-width="2" stroke-dasharray="4,3" />'
                 )
                 widget.load(dtr_svg_str.replace("</svg>", dot + "\n</svg>", 1).encode('utf-8'))
@@ -3791,7 +3812,7 @@ class GeometryCorrectionGUI(QMainWindow):
         # Inverse of map_line_to_Radon_space
         # Undo the >1 wrap (we don't know which branch was taken, but a_val ∈ [0,1])
         theta = a_val * np.pi                          # angle of line normal
-        t_signed = (0.5 - t_val) * range_t            # signed distance from image centre
+        t_signed = -(0.5 - t_val) * range_t           # signed distance from image centre
 
         # Reconstruct centered homogeneous line [cos θ, sin θ, -t]
         l_c = np.array([np.cos(theta), np.sin(theta), -t_signed])
@@ -4024,6 +4045,18 @@ class GeometryCorrectionGUI(QMainWindow):
                 l = hessianNormalForm(l).flatten()
                 svg.add(svg_homogeneous_line, l=l, stroke=family_color, stroke_width=1.0)
             
+            # Draw epipole if it is inside the detector
+            P_other = P2_obj if is_view1 else P1_obj
+            C_other = P_other.getCenterOfProjection()
+            epipole_hom = (P_active.P @ C_other).flatten()
+            if abs(epipole_hom[2]) > 1e-8:
+                ex = epipole_hom[0] / epipole_hom[2]
+                ey = epipole_hom[1] / epipole_hom[2]
+                if 0 <= ex < W and 0 <= ey < H:
+                    def draw_epipole(**kwargs):
+                        return f'<circle cx="{ex:.2f}" cy="{ey:.2f}" r="6" fill="#00ffff" stroke="white" stroke-width="1.5" />'
+                    svg.add(draw_epipole)
+            
             # Draw clicked epipolar line if click is active
             if self.clicked_point_viewport is not None and self.clicked_point_coords is not None:
                 c_view = self.clicked_point_viewport
@@ -4192,7 +4225,7 @@ class GeometryCorrectionGUI(QMainWindow):
                 
                 # Draw a circle on the curve
                 def draw_clicked_point_dtr(**kwargs):
-                    return f'<circle cx="{a_idx_click:.2f}" cy="{t_idx_click:.2f}" r="5" fill="yellow" stroke="white" stroke-width="1.5" />'
+                    return f'<circle cx="{a_idx_click:.2f}" cy="{t_idx_click:.2f}" r="10" fill="yellow" stroke="white" stroke-width="1.5" />'
                 dtr_svg.add(draw_clicked_point_dtr)
             
             # Render SVG and display; also cache for hover dot overlay
@@ -4528,22 +4561,28 @@ class GeometryCorrectionGUI(QMainWindow):
 
             # Combine cost matrix (lower triangle) and weight matrix (upper triangle)
             weight_matrix = diag["weight_matrix"]
-            valid_costs = self.cost_matrix[self.cost_matrix >= 0]
-            max_cost = float(np.max(valid_costs)) if valid_costs.size > 0 else 1.0
-            if max_cost <= 0:
-                max_cost = 1.0
-
             n_views = self.cost_matrix.shape[0]
             combined_matrix = np.zeros_like(self.cost_matrix)
 
             lower_indices = np.tril_indices(n_views, k=-1)
-            combined_matrix[lower_indices] = self.cost_matrix[lower_indices]
+            cost_lower = np.nan_to_num(self.cost_matrix[lower_indices], nan=0.0)
+            max_cost_val = float(np.nanmax(cost_lower)) if cost_lower.size > 0 else 1.0
+            if max_cost_val <= 0:
+                max_cost_val = 1.0
+            combined_matrix[lower_indices] = cost_lower / max_cost_val
 
             upper_indices = np.triu_indices(n_views, k=1)
-            clipped_weights = np.clip(weight_matrix[upper_indices], 0.0, 1.0)
-            combined_matrix[upper_indices] = clipped_weights * max_cost
+            weight_upper = np.nan_to_num(weight_matrix[upper_indices], nan=0.0)
+            max_weight_val = float(np.nanmax(weight_upper)) if weight_upper.size > 0 else 1.0
+            if max_weight_val <= 0:
+                max_weight_val = 1.0
+            combined_matrix[upper_indices] = weight_upper / max_weight_val
 
             np.fill_diagonal(combined_matrix, -1)
+            
+            print(f"[Diagnostics] Cost matrix size: {n_views}x{n_views}")
+            print(f"[Diagnostics] Max cost: {max_cost_val:.6e} | Max weight: {max_weight_val:.6e}")
+            sys.stdout.flush()
 
             # Show the labels now that data is computed
             self.lbl_object_radius.show()
@@ -4555,7 +4594,7 @@ class GeometryCorrectionGUI(QMainWindow):
             
             # 1. Plot Cost & Weights Matrix
             self.ax_cost.clear()
-            self.ax_cost.imshow(combined_matrix, cmap='gray', interpolation='nearest')
+            self.ax_cost.imshow(combined_matrix, cmap='gray', interpolation='nearest', vmin=0.0, vmax=1.0)
             self.ax_cost.axis('off')
             self.canvas_cost.draw()
 
@@ -4866,6 +4905,9 @@ class GeometryCorrectionGUI(QMainWindow):
             "object_radius_mm": self.spin_object_radius.value()
         }
 
+        # Save current stage state to its json file on disk first
+        self.save_single_stage(abs_path, stage)
+
         dialog = OptimizationProgressDialog(self, self.scan, stage, metric_config)
         dialog.start()
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -4932,8 +4974,10 @@ class GeometryCorrectionGUI(QMainWindow):
         # Save stage config to disk first to capture latest UI changes
         self.save_single_stage(abs_path, stage)
 
-        # Output directory is 'analysis' folder inside current_config's parent
-        out_dir = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(self.current_config_path)), "analysis"))
+        # Output directory is where other files for the ECC correction are stored
+        out_dir = self.txt_out_dir.text().strip()
+        if not out_dir or out_dir == "Select Output Folder":
+            out_dir = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(self.current_config_path)), "analysis"))
         os.makedirs(out_dir, exist_ok=True)
 
         # Show progress dialog
@@ -4947,23 +4991,33 @@ class GeometryCorrectionGUI(QMainWindow):
         try:
             import shutil
             # Resolve executable commands
+            # We can run them via the python interpreter modules to be more robust
             exe_ident = shutil.which("sloppy-direction-analysis")
-            if not exe_ident:
+            if exe_ident:
+                cmd_ident_base = [exe_ident]
+            else:
                 p = os.path.join(os.path.dirname(sys.executable), "sloppy-direction-analysis")
-                exe_ident = p if os.path.exists(p) else "sloppy-direction-analysis"
+                if os.path.exists(p):
+                    cmd_ident_base = [p]
+                else:
+                    cmd_ident_base = [sys.executable, "-m", "xray_epipolar_consistency.tools.sloppy_direction_analysis"]
 
             exe_advisor = shutil.which("optimization-advisor")
-            if not exe_advisor:
+            if exe_advisor:
+                cmd_advisor_base = [exe_advisor]
+            else:
                 p = os.path.join(os.path.dirname(sys.executable), "optimization-advisor")
-                exe_advisor = p if os.path.exists(p) else "optimization-advisor"
+                if os.path.exists(p):
+                    cmd_advisor_base = [p]
+                else:
+                    cmd_advisor_base = [sys.executable, "-m", "xray_epipolar_consistency.tools.optimization_advisor"]
 
             # Run sloppy direction analysis
             progress.setValue(20)
             progress.setLabelText("Running Sloppy Direction Analysis...")
             QApplication.processEvents()
             
-            cmd_ident = [
-                exe_ident,
+            cmd_ident = cmd_ident_base + [
                 recon_config_abs,
                 abs_path,
                 "--output_dir", out_dir,
@@ -4982,8 +5036,7 @@ class GeometryCorrectionGUI(QMainWindow):
             progress.setLabelText("Running Optimization Advisor...")
             QApplication.processEvents()
 
-            cmd_advisor = [
-                exe_advisor,
+            cmd_advisor = cmd_advisor_base + [
                 recon_config_abs,
                 abs_path,
                 "--output_dir", out_dir,
