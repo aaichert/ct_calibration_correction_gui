@@ -2874,10 +2874,8 @@ class GeometryCorrectionGUI(QMainWindow):
                 
             # Output Directory
             out_dir = self.txt_out_dir.text().strip()
-            if out_dir and out_dir != "Select Output Folder":
-                output_dir_rel = safe_relpath(out_dir, config_dir)
-            else:
-                output_dir_rel = "output/synthetic_pumpkin"
+            output_dir_rel = safe_relpath(out_dir, config_dir)
+
                 
             # Checked stages
             checked_rel_paths = []
