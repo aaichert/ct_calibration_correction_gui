@@ -67,6 +67,7 @@ from xray_epipolar_consistency.parameterization.gantry_angle import GantryAngle
 from xray_epipolar_consistency.parameterization.time_variant import LinearDrift, ContinuousMotion, TimeVariant
 from xray_epipolar_consistency.parameterization.turntable import Turntable
 from xray_epipolar_consistency.parameterization.source_shift_agc import SourceShiftAGC
+from xray_epipolar_consistency.parameterization.refinement import Refinement
 
 # Available Parameterizations mapping
 AVAILABLE_PARAMS = {
@@ -80,6 +81,7 @@ AVAILABLE_PARAMS = {
     "Continuous Motion": ContinuousMotion,
     "Turntable": Turntable,
     "Source Shift AGC": SourceShiftAGC,
+    "Refinement": Refinement,
 }
 
 
@@ -1390,21 +1392,19 @@ class GeometryCorrectionGUI(QMainWindow):
         gen_layout.addLayout(out_path_lay)
         
         # Reconstruction Settings
-        self.btn_recon_settings = QPushButton("Reconstruction Settings...")
-        self.btn_recon_settings.clicked.connect(self.open_reconstruction_settings)
-        gen_layout.addWidget(self.btn_recon_settings)
-
-        chk_recon_report_lay = QHBoxLayout()
-        self.chk_run_recon = QCheckBox("Run Reconstruction")
-        self.chk_run_recon.setChecked(True)
-        self.chk_run_recon.stateChanged.connect(self.update_json_preview)
-        chk_recon_report_lay.addWidget(self.chk_run_recon)
-
-        self.chk_create_report = QCheckBox("Create Report")
-        self.chk_create_report.setChecked(True)
-        self.chk_create_report.stateChanged.connect(self.update_json_preview)
-        chk_recon_report_lay.addWidget(self.chk_create_report)
-        gen_layout.addLayout(chk_recon_report_lay)
+        # Pipeline execution checkboxes next to each other
+        pipeline_lay = QHBoxLayout()
+        self.chk_run_refinement = QCheckBox("Run Refinement")
+        self.chk_run_refinement.setChecked(False)
+        self.chk_run_refinement.stateChanged.connect(self.update_json_preview)
+        
+        self.chk_run_reconstruction = QCheckBox("Run Reconstruction")
+        self.chk_run_reconstruction.setChecked(False)
+        self.chk_run_reconstruction.stateChanged.connect(self.update_json_preview)
+        
+        pipeline_lay.addWidget(self.chk_run_refinement)
+        pipeline_lay.addWidget(self.chk_run_reconstruction)
+        gen_layout.addLayout(pipeline_lay)
         
         # Metric Configuration
         grp_metric = QGroupBox("ECC Metric Settings")
@@ -1461,20 +1461,29 @@ class GeometryCorrectionGUI(QMainWindow):
         left_layout.addWidget(grp_preview, 1)
         
         # Run Buttons
-        self.btn_compare_recon = QPushButton("Compare Reconstructions...")
-        self.btn_compare_recon.clicked.connect(self.compare_reconstructions_action)
-        self.btn_compare_recon.setStyleSheet("font-weight: bold; background-color: #0284c7; color: white;")
-        left_layout.addWidget(self.btn_compare_recon)
-
-        run_lay = QHBoxLayout()
+        row1_lay = QHBoxLayout()
         self.btn_run_opt = QPushButton("Run Optimization...")
         self.btn_run_opt.clicked.connect(self.run_optimization_action)
         self.btn_run_opt.setStyleSheet("font-weight: bold; background-color: #2e7d32; color: white;")
-        run_lay.addWidget(self.btn_run_opt)
+        row1_lay.addWidget(self.btn_run_opt)
+
+        self.btn_run_refine = QPushButton("Run Refinement...")
+        self.btn_run_refine.clicked.connect(self.run_refinement_action)
+        self.btn_run_refine.setStyleSheet("font-weight: bold; background-color: #0284c7; color: white;")
+        row1_lay.addWidget(self.btn_run_refine)
+        left_layout.addLayout(row1_lay)
+
+        row2_lay = QHBoxLayout()
         self.btn_run_recon = QPushButton("Run Reconstruction...")
         self.btn_run_recon.clicked.connect(self.run_reconstruction_direct_action)
-        run_lay.addWidget(self.btn_run_recon)
-        left_layout.addLayout(run_lay)
+        self.btn_run_recon.setStyleSheet("font-weight: bold; background-color: #0284c7; color: white;")
+        row2_lay.addWidget(self.btn_run_recon)
+
+        self.btn_view_results = QPushButton("View Results...")
+        self.btn_view_results.clicked.connect(self.compare_reconstructions_action)
+        self.btn_view_results.setStyleSheet("font-weight: bold;")
+        row2_lay.addWidget(self.btn_view_results)
+        left_layout.addLayout(row2_lay)
         
         # Right Panel: Stages Manager
         right_panel = QGroupBox("Geometry Calibration Stages")
@@ -1602,12 +1611,14 @@ class GeometryCorrectionGUI(QMainWindow):
         self.stage_details_lay.addLayout(btn_param_lay)
         
         # Table of details for selected parameterization
-        self.stage_details_lay.addWidget(QLabel("Edit Individual Parameters:"))
+        self.lbl_edit_params = QLabel("Edit Individual Parameters:")
+        self.lbl_edit_params.setWordWrap(True)
         self.table_param_details = QTableWidget()
         self.table_param_details.setColumnCount(7)
         self.table_param_details.setHorizontalHeaderLabels(["Name", "Optimize", "Min Range", "Max Range", "Auto Range", "Sweep", "1D Search"])
         self.table_param_details.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table_param_details.setMinimumHeight(220)
+        self.stage_details_lay.addWidget(self.lbl_edit_params)
         self.stage_details_lay.addWidget(self.table_param_details)
         
         right_layout.addWidget(self.stage_details_grp, 0)
@@ -2031,9 +2042,17 @@ class GeometryCorrectionGUI(QMainWindow):
         stage, _ = self.get_active_stage()
         if not stage or row < 0 or row >= len(stage.parameterizations):
             self.table_param_details.setRowCount(0)
+            self.lbl_edit_params.setText("Edit Individual Parameters:")
             return
             
         param_obj = stage.parameterizations[row]
+        doc = param_obj.__class__.__doc__ or ""
+        doc_clean = " ".join(line.strip() for line in doc.strip().split("\n") if line.strip())
+        if doc_clean:
+            self.lbl_edit_params.setText(f"<b>Edit Individual Parameters ({param_obj.__class__.__name__}):</b><br><i>{doc_clean}</i>")
+        else:
+            self.lbl_edit_params.setText(f"<b>Edit Individual Parameters ({param_obj.__class__.__name__}):</b>")
+            
         self.table_param_details.blockSignals(True)
         
         # Group parameters ending in _cp{i}
@@ -2077,6 +2096,9 @@ class GeometryCorrectionGUI(QMainWindow):
             # Name
             item_name = QTableWidgetItem(row_data["display_name"])
             item_name.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            desc = row_data["config"].get("description", "")
+            if desc:
+                item_name.setToolTip(desc)
             self.table_param_details.setItem(idx, 0, item_name)
             
             # Optimize (Checkbox)
@@ -2474,8 +2496,13 @@ class GeometryCorrectionGUI(QMainWindow):
         
         # Show a context menu of available parameterizations
         menu = QMenu(self)
+        menu.setToolTipsVisible(True)
         for label, cls in AVAILABLE_PARAMS.items():
             act = QAction(label, self)
+            doc = cls.__doc__ or ""
+            doc_clean = " ".join(line.strip() for line in doc.strip().split("\n") if line.strip())
+            if doc_clean:
+                act.setToolTip(doc_clean)
             act.triggered.connect(lambda checked, c=cls: self.insert_parameterization(stage, c))
             menu.addAction(act)
         menu.exec(self.sender().mapToGlobal(self.sender().rect().bottomLeft()))
@@ -2899,7 +2926,6 @@ class GeometryCorrectionGUI(QMainWindow):
             preview_dict = {
                 "input_data": undersampled_recon_filename,
                 "output_dir": output_dir_rel,
-                "create_report": self.chk_create_report.isChecked(),
                 "metric_config": {
                     "convert_to_line_integral": self.chk_line_integral.isChecked(),
                     "dtr_size_factor": dtr_factor,
@@ -2909,9 +2935,11 @@ class GeometryCorrectionGUI(QMainWindow):
                 },
                 "geometry_optimization": {
                     "stages": checked_rel_paths
-                }
+                },
+                "run_refinement": self.chk_run_refinement.isChecked(),
+                "run_reconstruction": self.chk_run_reconstruction.isChecked()
             }
-            if self.chk_run_recon.isChecked():
+            if orig_recon_rel:
                 preview_dict["reconstruction_config"] = orig_recon_rel
             self.txt_json_preview.setPlainText(json.dumps(preview_dict, indent=2))
         except Exception as e:
@@ -3436,17 +3464,14 @@ class GeometryCorrectionGUI(QMainWindow):
                 
                 self.current_config_path = file_path
                 
-                # Restore reconstruction checkbox state based on run_reconstruction key (or fallback to reconstruction_config existence)
-                run_recon = config.get("run_reconstruction")
-                if run_recon is None:
-                    run_recon = "reconstruction_config" in config
-                self.chk_run_recon.blockSignals(True)
-                self.chk_run_recon.setChecked(bool(run_recon))
-                self.chk_run_recon.blockSignals(False)
+                # Restore pipeline execution checkboxes
+                self.chk_run_refinement.blockSignals(True)
+                self.chk_run_refinement.setChecked(config.get("run_refinement", False))
+                self.chk_run_refinement.blockSignals(False)
 
-                self.chk_create_report.blockSignals(True)
-                self.chk_create_report.setChecked(config.get("create_report", True))
-                self.chk_create_report.blockSignals(False)
+                self.chk_run_reconstruction.blockSignals(True)
+                self.chk_run_reconstruction.setChecked(config.get("run_reconstruction", False))
+                self.chk_run_reconstruction.blockSignals(False)
 
                 # Restore output directory if specified
                 out_dir_rel = config.get("output_dir")
@@ -4801,8 +4826,6 @@ class GeometryCorrectionGUI(QMainWindow):
             config_json = {
                 "input_data": undersampled_recon_filename,
                 "output_dir": safe_relpath(self.txt_out_dir.text(), config_dir),
-                "create_report": self.chk_create_report.isChecked(),
-                "run_reconstruction": self.chk_run_recon.isChecked(),
                 "metric_config": {
                     "convert_to_line_integral": self.chk_line_integral.isChecked(),
                     "dtr_size_factor": dtr_factor,
@@ -4812,7 +4835,9 @@ class GeometryCorrectionGUI(QMainWindow):
                 },
                 "geometry_optimization": {
                     "stages": checked_rel_paths
-                }
+                },
+                "run_refinement": self.chk_run_refinement.isChecked(),
+                "run_reconstruction": self.chk_run_reconstruction.isChecked()
             }
             if orig_recon_rel:
                 config_json["reconstruction_config"] = orig_recon_rel
@@ -4830,12 +4855,6 @@ class GeometryCorrectionGUI(QMainWindow):
             return False
 
     def run_optimization_action(self):
-        if self.chk_run_recon.isChecked():
-            recon_path = self.txt_recon_path.text().strip()
-            if not recon_path or recon_path == "No file loaded" or not os.path.exists(recon_path):
-                QMessageBox.warning(self, "Missing Reconstruction Config", "Please load a valid reconstruction config first or uncheck 'Run Reconstruction'.")
-                return
-
         # Save config first
         out_dir = self.txt_out_dir.text().strip()
         geom_config_path = os.path.join(out_dir, "geometry_correction.json")
@@ -5195,21 +5214,7 @@ class GeometryCorrectionGUI(QMainWindow):
             return None
         return txt.text().strip() or "_intermediate"
 
-    def run_reconstruction_direct_action(self):
-        """Prompt for a suffix, write a reconstruction JSON with the
-        current in-memory trajectory, then run FDK in a background thread
-        showing a console window — exactly like the reconstruction GUI."""
-        if not self.current_recon_json:
-            QMessageBox.warning(self, "No Config", "Please load a reconstruction config first.")
-            return
-        if not self.P_list:
-            QMessageBox.warning(self, "No Trajectory", "No projection matrices loaded yet.")
-            return
-
-        suffix = self._ask_reconstruction_suffix()
-        if suffix is None:  # user cancelled
-            return
-
+    def run_reconstruction_action_with_suffix(self, suffix):
         # Default saving behavior: save geometry_correction.json and trajectory.ompl
         if not self.save_project_action():
             return
@@ -5292,6 +5297,22 @@ class GeometryCorrectionGUI(QMainWindow):
             QMessageBox.critical(self, "Reconstruction Error", f"Failed to start reconstruction:\n{traceback.format_exc()}")
             self.show()
 
+    def run_reconstruction_direct_action(self):
+        """Prompt for a suffix, write a reconstruction JSON with the
+        current in-memory trajectory, then run FDK in a background thread
+        showing a console window — exactly like the reconstruction GUI."""
+        if not self.current_recon_json:
+            QMessageBox.warning(self, "No Config", "Please load a reconstruction config first.")
+            return
+        if not self.P_list:
+            QMessageBox.warning(self, "No Trajectory", "No projection matrices loaded yet.")
+            return
+
+        suffix = self._ask_reconstruction_suffix()
+        if suffix is None:  # user cancelled
+            return
+        self.run_reconstruction_action_with_suffix(suffix)
+
     def resolve_reconstruct_file(self):
         try:
             return os.path.abspath(reconstruct.__file__)
@@ -5318,6 +5339,7 @@ class GeometryCorrectionGUI(QMainWindow):
         possible_paths = [
             os.path.normpath(os.path.join(cur_dir, "gui", "nrrd_view_3d.py")),
             os.path.normpath(os.path.join(cur_dir, "..", "reconstruct", "gui", "nrrd_view_3d.py")),
+            os.path.normpath(os.path.join(cur_dir, "..", "ct_recon_fdk_astra", "ct_recon_fdk_astra", "gui", "nrrd_view_3d.py")),
             "/run/media/aaichert/Intenso/reconstruct/gui/nrrd_view_3d.py"
         ]
         for p in possible_paths:
@@ -5359,13 +5381,14 @@ class GeometryCorrectionGUI(QMainWindow):
                 cmd = ["NrrdView3D"] + abs_paths
                 
             try:
-                subprocess.Popen(cmd)
+                subprocess.Popen(cmd, cwd=os.path.dirname(nrrd_view_3d_file) if nrrd_view_3d_file else None)
                 self.statusBar().showMessage(f"Launched NrrdView3D for comparison of {len(abs_paths)} files.", 5000)
             except Exception as e:
                 QMessageBox.critical(self, "Error Launching Viewer", f"Could not launch NrrdView3D:\n{e}")
 
     def on_reconstruction_direct_finished_new(self, success, config_path):
         if success:
+            self.show()
             try:
                 with open(config_path, 'r') as f:
                     cfg = json.load(f)
@@ -5389,114 +5412,140 @@ class GeometryCorrectionGUI(QMainWindow):
             QMessageBox.critical(self, "Reconstruction Error", "Reconstruction process failed. Please check the logs.")
 
     def on_correction_finished_new(self, success, log):
-        if success:
-            # Launch report.html in default browser
-            try:
-                out_dir = self.txt_out_dir.text().strip()
-                report_path = os.path.join(out_dir, "report.html")
-                if os.path.exists(report_path):
-                    webbrowser.open(os.path.abspath(report_path))
-            except Exception as e:
-                print(f"Failed to open report in browser: {e}")
+        pass
 
     def on_correction_dialog_closed(self, result):
         self.reload_after_optimization()
-        
-        success = (self.console_win.process.exitCode() == 0 and 
-                   self.console_win.process.exitStatus() == QProcess.ExitStatus.NormalExit)
-        
-        if success:
-            if self.chk_run_recon.isChecked():
-                out_dir = self.txt_out_dir.text().strip()
-                recon_config_abs = self.txt_recon_path.text().strip()
-                
-                recon_misaligned = os.path.normpath(os.path.join(out_dir, "recon_misaligned.nrrd"))
-                recon_optimized = os.path.normpath(os.path.join(out_dir, "recon_optimized.nrrd"))
-                
-                if recon_config_abs and recon_config_abs != "No file loaded" and os.path.exists(recon_config_abs):
-                    try:
-                        with open(recon_config_abs, 'r') as rf:
-                            recon_config = json.load(rf)
-                        orig_output_file = recon_config.get("output_file", "reconstruction.nrrd")
-                        orig_output_path_abs = os.path.abspath(os.path.join(os.path.dirname(recon_config_abs), orig_output_file))
-                        orig_dir = os.path.dirname(orig_output_path_abs)
-                        orig_name = os.path.basename(orig_output_path_abs)
-                        orig_base, orig_ext = os.path.splitext(orig_name)
-                        out_dir_name = os.path.basename(out_dir)
-                        
-                        recon_misaligned = orig_output_path_abs
-                        recon_optimized = os.path.normpath(os.path.join(orig_dir, f"{orig_base}_{out_dir_name}{orig_ext}"))
-                    except Exception as e:
-                        print(f"Error resolving reconstructed paths in GUI: {e}")
-                
-                if os.path.exists(recon_misaligned) and os.path.exists(recon_optimized):
-                    class InteractiveNrrdView3DWindow(NrrdView3DWindow):
-                        def __init__(self, parent_window):
-                            self.parent_window = parent_window
-                            super().__init__()
-                        def closeEvent(self, event):
-                            super().closeEvent(event)
-                            if self.parent_window:
-                                self.parent_window.show()
-                    
-                    self.hide()
-                    self.nrrd_win_opt = InteractiveNrrdView3DWindow(self)
-                    self.nrrd_win_opt.show()
-                    self.nrrd_win_opt.open_file([recon_misaligned, recon_optimized])
-                else:
-                    QMessageBox.warning(
-                        self, "Reconstruction Not Found",
-                        f"Expected reconstruction volumes not found:\n- {recon_misaligned}\n- {recon_optimized}\n"
-                        "Please check if ASTRA / reconstruct is installed correctly."
-                    )
-                    self.show()
-            else:
-                self.run_reconstruction_action()
-        else:
-            self.show()
+        self.show()
 
     def reload_after_optimization(self):
-        # Once calibration is completed, reload optimized matrices in the viewport if available
-        out_dir = self.txt_out_dir.text()
+        # Once calibration is completed, reload optimized/refined matrices in the viewport if available
+        out_dir = self.txt_out_dir.text().strip()
+        refined_ompl = os.path.normpath(os.path.join(out_dir, "trajectory_refined.ompl"))
+        opt_ompl = os.path.normpath(os.path.join(out_dir, "trajectory_optimized.ompl"))
         opt_param_path = os.path.join(out_dir, "parameterization.json")
         
         # Ensure we have the original full trajectory loaded
         if not self.P_list_original:
             self.P_list_original = list(self.P_list)
             
-        if os.path.exists(opt_param_path):
+        loaded = False
+        
+        # 1. Try loading refined trajectory first
+        if os.path.exists(refined_ompl):
+            try:
+                Ps_refined = load_ompl(refined_ompl)
+                H_img, W_img = self.P_list_original[0].image_size
+                pixel_spacing = self.P_list_original[0].pixel_spacing
+                self.P_list = [
+                    ProjectionMatrix(
+                        P.P if hasattr(P, "P") else P,
+                        image_size=(W_img, H_img),
+                        pixel_spacing=pixel_spacing
+                    )
+                    for P in Ps_refined
+                ]
+                loaded = True
+                self.statusBar().showMessage("Reloaded refined geometry into viewport successfully.")
+            except Exception as e:
+                self.statusBar().showMessage(f"Failed to reload refined geometry: {str(e)}")
+                
+        # 2. Try loading optimized trajectory second
+        if not loaded and os.path.exists(opt_ompl):
+            try:
+                Ps_opt = load_ompl(opt_ompl)
+                H_img, W_img = self.P_list_original[0].image_size
+                pixel_spacing = self.P_list_original[0].pixel_spacing
+                self.P_list = [
+                    ProjectionMatrix(
+                        P.P if hasattr(P, "P") else P,
+                        image_size=(W_img, H_img),
+                        pixel_spacing=pixel_spacing
+                    )
+                    for P in Ps_opt
+                ]
+                loaded = True
+                self.statusBar().showMessage("Reloaded optimized geometry into viewport successfully.")
+            except Exception as e:
+                self.statusBar().showMessage(f"Failed to reload optimized geometry: {str(e)}")
+
+        # 3. Fallback to parameterization.json
+        if not loaded and os.path.exists(opt_param_path):
             try:
                 with open(opt_param_path, 'r') as f:
                     opt_param_dict = json.load(f)
                 opt_chain = from_dict(opt_param_dict)
-                
-                # Apply optimized parameters to original full trajectory
                 P_opt_all = opt_chain.apply_to_trajectory(self.P_list_original)
                 self.P_list = P_opt_all
-                
-                # Save optimized trajectory (all views) to trajectory_optimized.ompl
-                opt_ompl = os.path.join(out_dir, "trajectory_optimized.ompl")
                 save_ompl(
                     self.P_list,
                     opt_ompl,
                     spacing=self.P_list_original[0].pixel_spacing,
                     detector_size_px=self.P_list_original[0].image_size
                 )
-                
-                if self.scan:
-                    self.scan.set_projection_matrices(self.P_list_undersampled)
-                
-                # Reset all parameters to 0 since matrices are now updated to the optimized state
-                for stage in self.stages_cache.values():
-                    for param_obj in stage.parameterizations:
-                        for name in param_obj.parameters:
-                            param_obj.parameters[name]["value"] = 0.0
-                            
-                self.select_stage(self.list_stages.currentRow())
-                self.render_viewports()
+                loaded = True
                 self.statusBar().showMessage("Reloaded optimized geometry into viewport successfully.")
             except Exception as e:
                 self.statusBar().showMessage(f"Failed to reload optimized geometry: {str(e)}")
+
+        if loaded:
+            if self.scan:
+                self.scan.set_projection_matrices(self.P_list_undersampled)
+            for stage in self.stages_cache.values():
+                for param_obj in stage.parameterizations:
+                    for name in param_obj.parameters:
+                        param_obj.parameters[name]["value"] = 0.0
+            self.select_stage(self.list_stages.currentRow())
+            self.render_viewports()
+
+    def run_refinement_action(self):
+        out_dir = self.txt_out_dir.text().strip()
+        geom_config_path = os.path.join(out_dir, "geometry_correction.json")
+        config_path = self.save_geometry_config(geom_config_path)
+        if not config_path:
+            return
+            
+        # Save the GUI's current in-memory full trajectory to trajectory_optimized.ompl so refinement starts from it
+        opt_ompl_path = os.path.join(out_dir, "trajectory_optimized.ompl")
+        try:
+            save_ompl(
+                self.P_list,
+                opt_ompl_path,
+                spacing=self.P_list[0].pixel_spacing if self.P_list else 1.0,
+                detector_size_px=self.P_list[0].image_size if self.P_list else (1, 1)
+            )
+        except Exception as e:
+            print(f"Warning: Failed to save starting trajectory for refinement: {e}")
+            
+        cmd = f'"{sys.executable}" -u -m xray_epipolar_consistency.tools.geometry_refinement "{config_path}"'
+        self.console_win = ProcessConsoleWindow(
+            command=cmd,
+            working_dir=os.path.dirname(config_path),
+            title="Geometry Refinement Console",
+            parent=self,
+            show_progress=True
+        )
+        
+        self.console_win.finished.connect(lambda result: self.on_refinement_dialog_closed(result))
+        self.console_win.show()
+        self.hide()
+
+    def on_refinement_dialog_closed(self, result):
+        self.reload_after_optimization()
+        self.show()
+        
+        success = (self.console_win.process.exitCode() == 0 and 
+                   self.console_win.process.exitStatus() == QProcess.ExitStatus.NormalExit)
+        
+        if success and not self.chk_run_reconstruction.isChecked():
+            reply = QMessageBox.question(
+                self, 'Run Reconstruction',
+                "Refinement completed successfully.\nDo you want to run reconstruction now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                QTimer.singleShot(100, lambda: self.run_reconstruction_action_with_suffix("_refined"))
 
 
 class StartupWindow(QWidget):
