@@ -380,8 +380,10 @@ class OptimizationProgressDialog(QDialog):
         self.txt_console.setFont(QFont("Courier New", 10))
         layout.addWidget(self.txt_console)
         
-        # Buttons (Cancel/Discard and Apply)
+        # Buttons (Cancel/Discard and Apply options)
         btn_layout = QHBoxLayout()
+        
+        self.apply_aligned = False
         
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.clicked.connect(self.cancel_optimization)
@@ -389,8 +391,13 @@ class OptimizationProgressDialog(QDialog):
         
         self.btn_apply = QPushButton("Apply")
         self.btn_apply.setEnabled(False)
-        self.btn_apply.clicked.connect(self.accept)
+        self.btn_apply.clicked.connect(self.apply_direct_action)
         btn_layout.addWidget(self.btn_apply)
+
+        self.btn_apply_aligned = QPushButton("Auto Align & Apply")
+        self.btn_apply_aligned.setEnabled(False)
+        self.btn_apply_aligned.clicked.connect(self.apply_aligned_action)
+        btn_layout.addWidget(self.btn_apply_aligned)
         
         layout.addLayout(btn_layout)
         
@@ -416,6 +423,14 @@ class OptimizationProgressDialog(QDialog):
         
     def start(self):
         self.thread.start()
+        
+    def apply_direct_action(self):
+        self.apply_aligned = False
+        self.accept()
+
+    def apply_aligned_action(self):
+        self.apply_aligned = True
+        self.accept()
         
     def append_log(self, text):
         self.txt_console.moveCursor(self.txt_console.textCursor().MoveOperation.End)
@@ -469,6 +484,14 @@ class OptimizationProgressDialog(QDialog):
                 QMessageBox.StandardButton.Yes
             )
             if reply == QMessageBox.StandardButton.Yes:
+                align_reply = QMessageBox.question(
+                    self,
+                    "Auto Align Trajectory",
+                    "Would you like to automatically align the trajectory to the reference geometry before applying?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes
+                )
+                self.apply_aligned = (align_reply == QMessageBox.StandardButton.Yes)
                 self.optimization_result = result
                 self.accept()
             else:
@@ -478,7 +501,8 @@ class OptimizationProgressDialog(QDialog):
         self.lbl_status.setText("Optimization finished.")
         self.btn_cancel.setText("Discard")
         self.btn_apply.setEnabled(True)
-        self.btn_apply.setDefault(True)
+        self.btn_apply_aligned.setEnabled(True)
+        self.btn_apply_aligned.setDefault(True)
         self.optimization_result = result
         
         # Report the result of optimization
@@ -4946,8 +4970,30 @@ class GeometryCorrectionGUI(QMainWindow):
                 try:
                     opt_chain = from_dict(result["optimized_parameterization"])
                     
-                    # Apply optimized parameters to original full trajectory in memory (P_list)
-                    self.P_list = opt_chain.apply_to_trajectory(self.P_list)
+                    if dialog.apply_aligned:
+                        # Load original uncorrected OMPL trajectory from file to prevent state corruption/copies
+                        try:
+                            recon_config_abs = self.original_recon_config_path or self.txt_recon_path.text()
+                            recon_dir = os.path.dirname(recon_config_abs)
+                            ompl_path = os.path.normpath(os.path.join(recon_dir, self.current_recon_json["ompl_file"]))
+                            Ps_original = load_ompl(ompl_path)
+                            
+                            # Apply optimized chain to the loaded original trajectory
+                            Ps_opt = opt_chain.apply_to_trajectory(Ps_original)
+                            
+                            # Align Ps_opt to Ps_original
+                            from xray_epipolar_consistency.tools.geometry_correction import align_trajectories
+                            Ps_aligned, _ = align_trajectories(Ps_opt, Ps_original)
+                            
+                            self.P_list = Ps_aligned
+                        except Exception as alignment_err:
+                            # Fallback if trajectory loading or alignment fails
+                            print(f"Alignment failed: {alignment_err}. Falling back to direct application.")
+                            self.P_list = opt_chain.apply_to_trajectory(self.P_list)
+                    else:
+                        # Apply directly without alignment
+                        self.P_list = opt_chain.apply_to_trajectory(self.P_list)
+                        
                     self.dirty = True
                     
                     if self.scan:
