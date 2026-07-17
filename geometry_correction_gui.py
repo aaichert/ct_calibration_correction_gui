@@ -919,7 +919,7 @@ class Sweep2DWindow(QMainWindow):
 
 
 class Stage:
-    def __init__(self, name="Optimization Stage", optimizer="OptimizerPowell", maxiter=200, ftol=1e-6, eps=1e-3):
+    def __init__(self, name="Optimization Stage", optimizer="OptimizerLBFGS", maxiter=200, ftol=1e-6, eps=1e-3):
         self.name = name
         self.optimizer = optimizer
         self.maxiter = maxiter
@@ -1422,11 +1422,16 @@ class GeometryCorrectionGUI(QMainWindow):
         self.chk_run_refinement.setChecked(False)
         self.chk_run_refinement.stateChanged.connect(self.update_json_preview)
         
+        self.chk_refinement_warmup = QCheckBox("Refinement Warmup")
+        self.chk_refinement_warmup.setChecked(False)
+        self.chk_refinement_warmup.stateChanged.connect(self.update_json_preview)
+        
         self.chk_run_reconstruction = QCheckBox("Run Reconstruction")
         self.chk_run_reconstruction.setChecked(False)
         self.chk_run_reconstruction.stateChanged.connect(self.update_json_preview)
         
         pipeline_lay.addWidget(self.chk_run_refinement)
+        pipeline_lay.addWidget(self.chk_refinement_warmup)
         pipeline_lay.addWidget(self.chk_run_reconstruction)
         gen_layout.addLayout(pipeline_lay)
         
@@ -1584,7 +1589,7 @@ class GeometryCorrectionGUI(QMainWindow):
         
         opt_settings_lay.addWidget(QLabel("Optimizer:"))
         self.combo_optimizer = QComboBox()
-        self.combo_optimizer.addItems(["OptimizerPowell", "OptimizerLBFGS"])
+        self.combo_optimizer.addItems(["OptimizerLBFGS", "OptimizerPowell"])
         self.combo_optimizer.currentTextChanged.connect(self.update_stage_optimizer)
         opt_settings_lay.addWidget(self.combo_optimizer)
         
@@ -2352,7 +2357,7 @@ class GeometryCorrectionGUI(QMainWindow):
                 return
             
             # Create default Stage object
-            s_new = Stage(name=filename[:-5], optimizer="OptimizerPowell")
+            s_new = Stage(name=filename[:-5], optimizer="OptimizerLBFGS")
             s_new.parameterizations.append(DetectorOrientation())
             
             self.stages_cache[abs_path] = s_new
@@ -2961,6 +2966,7 @@ class GeometryCorrectionGUI(QMainWindow):
                     "stages": checked_rel_paths
                 },
                 "run_refinement": self.chk_run_refinement.isChecked(),
+                "refinement_warmup": self.chk_refinement_warmup.isChecked(),
                 "run_reconstruction": self.chk_run_reconstruction.isChecked()
             }
             if orig_recon_rel:
@@ -3052,7 +3058,7 @@ class GeometryCorrectionGUI(QMainWindow):
                 stage_json = json.load(sf)
             
             name = stage_json.get("name", os.path.basename(abs_path))
-            optimizer = stage_json.get("classname", "OptimizerPowell")
+            optimizer = stage_json.get("classname", "OptimizerLBFGS")
             maxiter = stage_json.get("kwargs", {}).get("options", {}).get("maxiter", 200)
             ftol = stage_json.get("kwargs", {}).get("options", {}).get("ftol", 1e-12)
             
@@ -3488,10 +3494,13 @@ class GeometryCorrectionGUI(QMainWindow):
                 
                 self.current_config_path = file_path
                 
-                # Restore pipeline execution checkboxes
                 self.chk_run_refinement.blockSignals(True)
                 self.chk_run_refinement.setChecked(config.get("run_refinement", False))
                 self.chk_run_refinement.blockSignals(False)
+
+                self.chk_refinement_warmup.blockSignals(True)
+                self.chk_refinement_warmup.setChecked(config.get("refinement_warmup", False))
+                self.chk_refinement_warmup.blockSignals(False)
 
                 self.chk_run_reconstruction.blockSignals(True)
                 self.chk_run_reconstruction.setChecked(config.get("run_reconstruction", False))
@@ -4861,6 +4870,7 @@ class GeometryCorrectionGUI(QMainWindow):
                     "stages": checked_rel_paths
                 },
                 "run_refinement": self.chk_run_refinement.isChecked(),
+                "refinement_warmup": self.chk_refinement_warmup.isChecked(),
                 "run_reconstruction": self.chk_run_reconstruction.isChecked()
             }
             if orig_recon_rel:
@@ -4970,18 +4980,18 @@ class GeometryCorrectionGUI(QMainWindow):
                 try:
                     opt_chain = from_dict(result["optimized_parameterization"])
                     
+                    # First apply optimized parameters to the current active trajectory
+                    Ps_opt = opt_chain.apply_to_trajectory(self.P_list)
+
                     if dialog.apply_aligned:
-                        # Load original uncorrected OMPL trajectory from file to prevent state corruption/copies
+                        # Load original uncorrected OMPL trajectory from file to align against
                         try:
                             recon_config_abs = self.original_recon_config_path or self.txt_recon_path.text()
                             recon_dir = os.path.dirname(recon_config_abs)
                             ompl_path = os.path.normpath(os.path.join(recon_dir, self.current_recon_json["ompl_file"]))
                             Ps_original = load_ompl(ompl_path)
                             
-                            # Apply optimized chain to the loaded original trajectory
-                            Ps_opt = opt_chain.apply_to_trajectory(Ps_original)
-                            
-                            # Align Ps_opt to Ps_original
+                            # Align Ps_opt (which has all stages applied) to Ps_original
                             from xray_epipolar_consistency.tools.geometry_correction import align_trajectories
                             Ps_aligned, _ = align_trajectories(Ps_opt, Ps_original)
                             
@@ -4989,10 +4999,10 @@ class GeometryCorrectionGUI(QMainWindow):
                         except Exception as alignment_err:
                             # Fallback if trajectory loading or alignment fails
                             print(f"Alignment failed: {alignment_err}. Falling back to direct application.")
-                            self.P_list = opt_chain.apply_to_trajectory(self.P_list)
+                            self.P_list = Ps_opt
                     else:
                         # Apply directly without alignment
-                        self.P_list = opt_chain.apply_to_trajectory(self.P_list)
+                        self.P_list = Ps_opt
                         
                     self.dirty = True
                     
